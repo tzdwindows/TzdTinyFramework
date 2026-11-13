@@ -28,6 +28,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdio.h>
 
 #if MINI_MODE_CUSTOM

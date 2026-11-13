@@ -136,6 +136,9 @@ endif()
 # ---- The executable ------------------------------------------------
 add_executable(tiny_app ${CORE_SRC} $<TARGET_OBJECTS:quickjs_objs>)
 target_compile_definitions(tiny_app PRIVATE ${MODE_FLAGS})
+if(NOT WIN32)
+    target_compile_definitions(tiny_app PRIVATE _strdup=strdup _stricmp=strcasecmp _strnicmp=strncasecmp)
+endif()
 
 target_include_directories(tiny_app PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
