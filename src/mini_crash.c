@@ -429,12 +429,17 @@ void mini_crash_init(const char *app_name, const char *log_dir)
     signal(SIGTERM, sig_handler_win);
 #else
     /* alternate stack so a stack-overflow SIGSEGV is still reportable */
-    static char altstack[SIGSTKSZ * 2];
-    stack_t ss;
-    ss.ss_sp = altstack;
-    ss.ss_size = sizeof altstack;
-    ss.ss_flags = 0;
-    sigaltstack(&ss, NULL);
+    size_t alt_sz = (size_t)SIGSTKSZ * 2;
+    if (alt_sz < 65536) alt_sz = 65536;
+    static char *altstack = NULL;
+    if (!altstack) altstack = (char *)malloc(alt_sz);
+    if (altstack) {
+        stack_t ss;
+        ss.ss_sp = altstack;
+        ss.ss_size = alt_sz;
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    }
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
