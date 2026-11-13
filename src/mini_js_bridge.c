@@ -159,11 +159,13 @@ typedef void (*PFN_m_UniformMatrix3fv)(GLint, GLsizei, GLboolean, const GLfloat 
 #ifndef GLbitfield
 typedef unsigned int GLbitfield;
 #endif
+#if !defined(GL_ARB_sync) && !defined(GL_VERSION_3_2)
 #ifndef GLuint64
 typedef unsigned long long GLuint64;
 #endif
 #ifndef GLsync
 typedef void *GLsync;
+#endif
 #endif
 typedef void (*PFN_m_DisableVA)(GLuint);          /* glDisableVertexAttribArray */
 typedef void (*PFN_m_Flush)(void);
