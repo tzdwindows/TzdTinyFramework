@@ -23,11 +23,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build gcc g++ libglfw3-dev libgl-dev libvulkan-dev
+          sudo apt-get install -y cmake ninja-build clang libglfw3-dev libgl-dev libvulkan-dev
 
       - name: Configure CMake
         run: |
-          cmake -B build_linux -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -B build_linux -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
       - name: Build tiny_app
         run: |
