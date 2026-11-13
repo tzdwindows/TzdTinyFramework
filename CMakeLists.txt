@@ -33,7 +33,10 @@ endif()
 
 # Keep source UTF-8 for both input and exec charset (CJK comments/strings).
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8 -g -gcodeview)
+    add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8 -g)
+    if(WIN32)
+        add_compile_options(-gcodeview)
+    endif()
 endif()
 
 # ---- Vendored dependency: QuickJS ----------------------------------
