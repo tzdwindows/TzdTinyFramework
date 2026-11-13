@@ -11,6 +11,7 @@
 #ifndef MINI_EVENTS_H
 #define MINI_EVENTS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
