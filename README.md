@@ -14,7 +14,9 @@ You can build a modern web-app-as-desktop-app in a few megabytes that cold-start
 
 ## Highlights
 
-**Rendering** — vector command buffer flushed once per frame (state-sorted to minimise GL churn), stb_truetype glyph atlas with an 8-font fallback chain, scissor + rounded-corner clipping, LRU gradient cache, framebuffer→PNG screenshots.
+**Rendering** — Vulkan 2D renderer (`mini_vulkan.*`) + vector command buffer flushed once per frame (state-sorted to minimise GL churn), WebGL 1/2 bridge with PBO async readback, stb_truetype glyph atlas with an 8-font fallback chain, scissor + rounded-corner clipping, LRU gradient cache, framebuffer→PNG screenshots.
+
+**Audio** — lightweight `miniaudio` pull-based audio backend (`mini_audio.*`) with lock-free ring buffer and native C DSP block synthesis (`AudioContext`, `OscillatorNode`, `BiquadFilterNode`, `GainNode`, `ConstantSourceNode`, Tone.js compatible).
 
 **DOM & layout** — O(1) parent/child/sibling pointers mirroring the DOM, Block + Flexbox + Grid layout, Shadow DOM + slots, `::before/::after/::placeholder`, dirty-mark incremental relayout, full Canvas 2D path API.
 
@@ -97,7 +99,8 @@ Per frame: `diag.begin → poll events → rAF → pump jobs → layout → rend
 | Layer | Files |
 | --- | --- |
 | API / host | `mini_framework.h`, `main.c`, `mini_window.*` |
-| Rendering | `mini_renderer.*`, `mini_gradient.c`, `mini_png.*` |
+| Rendering | `mini_renderer.*`, `mini_vulkan.*`, `mini_gradient.c`, `mini_png.*` |
+| Audio | `mini_audio.*` |
 | DOM & layout | `mini_dom.*`, `mini_css.*`, `mini_bidi.*`, `mini_shaping.*` |
 | HTML5 / CSS parse | `mini_html5.*` |
 | JS bridge | `mini_js_bridge.*`, `mini_webgl_ext.*` |
@@ -137,6 +140,7 @@ Per frame: `diag.begin → poll events → rAF → pump jobs → layout → rend
 | [stb](https://github.com/nothings/stb) | image decode / truetype glyphs | Public Domain |
 | [SLJIT](https://github.com/zherczeg/sljit) | QuickJS native codegen | BSD-2-Clause |
 | [GLFW](https://www.glfw.org/) | window / input / GL context | Zlib |
+| [miniaudio](https://miniaud.io/) | lightweight audio playback | MIT-0 / Public Domain |
 
 Each retains its own license under `libs/`.
 
