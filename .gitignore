@@ -3,6 +3,7 @@
 
 # 2. 允许追踪 .gitignore 自身
 !.gitignore
+!.github/
 
 # 3. 显式放行指定的文件
 !build.ps1

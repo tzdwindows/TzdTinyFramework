@@ -202,7 +202,7 @@ if(WIN32)
         target_link_libraries(tiny_app PRIVATE m)
     endif()
 else()
-    target_link_libraries(tiny_app PRIVATE glfw GL m pthread)
+    target_link_libraries(tiny_app PRIVATE glfw vulkan GL m pthread dl)
 endif()
 
 # MbedTLS.

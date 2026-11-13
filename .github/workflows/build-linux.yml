@@ -1,0 +1,50 @@
+name: Build Linux Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-linux.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc g++ libglfw3-dev libgl-dev libvulkan-dev
+
+      - name: Configure CMake
+        run: |
+          cmake -B build_linux -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build tiny_app
+        run: |
+          cmake --build build_linux --target tiny_app -j$(nproc)
+
+      - name: Package Linux release archive
+        run: |
+          mkdir -p dist_linux
+          cp build/tiny_app dist_linux/tiny_app
+          chmod +x dist_linux/tiny_app
+          cp build/AiDianFengYaHeiChangTi.ttf dist_linux/
+          cp build/ZhouZiSongTi7000Zi-2.otf dist_linux/
+          cp LICENSE README.md dist_linux/
+          tar -czf TzdTinyFramework-linux-x64.tar.gz -C dist_linux .
+
+      - name: Upload to Release v0.2.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v0.2.0 TzdTinyFramework-linux-x64.tar.gz build/tiny_app#tiny_app-linux-x64 --clobber
