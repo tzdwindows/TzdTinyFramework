@@ -265,7 +265,8 @@ void mini_window_render_frame(struct MiniWindow *mw, double now_ms, double dt)
     if (!mw || !mw->r || !mw->win || mw->closing)
         return;
 
-    glfwMakeContextCurrent((GLFWwindow *)mw->win);
+    if (!mw->r->gpu.is_vulkan)
+        glfwMakeContextCurrent((GLFWwindow *)mw->win);
     /* switch the process-wide "active" globals to this window so layout/
        restyle/render/rAF operate on THIS window's document/renderer/bridge */
     mini_dom_set_active_doc(mw->doc);
@@ -298,12 +299,21 @@ void mini_window_render_frame(struct MiniWindow *mw, double now_ms, double dt)
     /* drain JS microtasks/macrotasks (timers/Promise.then) */
     mini_bridge_pump(mw->bridge);
 
+    int did_restyle = 0;
     if (mw->doc->dirty || mw->input_dirty || viewport_changed)
+    {
         mini_dom_restyle(mw->doc);
+        did_restyle = 1;
+    }
     mw->input_dirty = 0;
 
     if (mw->doc->dirty || mw->doc->layout_dirty)
         mini_layout_run(mw->doc, fw, fh);
+    if ((viewport_changed || mw->doc->needs_resize_event) && mw->bridge)
+    {
+        mw->doc->needs_resize_event = 0;
+        mini_bridge_dispatch_resize(mw->bridge);
+    }
 
     /* 1. clear + page backdrop */
     mini_renderer_begin_frame(mw->r);

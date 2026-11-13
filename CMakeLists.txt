@@ -17,8 +17,13 @@ option(GUI_APP           "Build as Windows GUI subsystem (-mwindows)"     ON)
 # Path to a prebuilt GLFW SDK. Override with -DGLFW_ROOT=/path/to/glfw.
 set(GLFW_ROOT "D:/glfw-3.4.bin.WIN64" CACHE PATH "Path to prebuilt GLFW SDK")
 
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build")
+
 # ---- Global definitions & flags -----------------------------------
 add_compile_definitions(_GNU_SOURCE)
+if(WIN32)
+    add_compile_definitions(strcasecmp=_stricmp strncasecmp=_strnicmp strtok_r=strtok_s)
+endif()
 
 if(TINY_NATIVE)
     set(MODE_FLAGS "")
@@ -28,7 +33,7 @@ endif()
 
 # Keep source UTF-8 for both input and exec charset (CJK comments/strings).
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
+    add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8 -g -gcodeview)
 endif()
 
 # ---- Vendored dependency: QuickJS ----------------------------------
@@ -55,6 +60,7 @@ if(MINI_JIT)
         target_compile_definitions(quickjs_objs PRIVATE JS_JIT_CODEGEN)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/sljit/sljit_src")
             target_include_directories(quickjs_objs PRIVATE libs/sljit/sljit_src)
+            target_sources(quickjs_objs PRIVATE libs/sljit/sljit_src/sljitLir.c)
         endif()
     endif()
 endif()
@@ -80,6 +86,7 @@ endif()
 set(CORE_SRC
         src/main.c
         src/mini_renderer.c
+        src/mini_vulkan.c
         src/mini_gradient.c
         src/mini_css.c
         src/mini_dom.c
@@ -128,10 +135,12 @@ add_executable(tiny_app ${CORE_SRC} $<TARGET_OBJECTS:quickjs_objs>)
 target_compile_definitions(tiny_app PRIVATE ${MODE_FLAGS})
 
 target_include_directories(tiny_app PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/quickjs
         ${CMAKE_CURRENT_SOURCE_DIR}/libs/stb
+        ${CMAKE_CURRENT_SOURCE_DIR}/libs/miniaudio
         $<$<BOOL:${MINI_TLS}>:${CMAKE_CURRENT_SOURCE_DIR}/libs/mbedtls/include>
         $<$<BOOL:${MINI_JIT_CODEGEN}>:${CMAKE_CURRENT_SOURCE_DIR}/libs/sljit/sljit_src>
 )
@@ -140,17 +149,36 @@ target_include_directories(tiny_app PRIVATE
 if(EXISTS "${GLFW_ROOT}/include")
     target_include_directories(tiny_app PRIVATE "${GLFW_ROOT}/include")
 endif()
-if(EXISTS "${GLFW_ROOT}/lib-mingw-w64")
-    target_link_directories(tiny_app PRIVATE "${GLFW_ROOT}/lib-mingw-w64")
+if(WIN32)
+    if(MSVC OR (CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC") OR (CMAKE_C_SIMULATE_ID STREQUAL "MSVC"))
+        if(EXISTS "${GLFW_ROOT}/lib-vc2022")
+            target_link_directories(tiny_app PRIVATE "${GLFW_ROOT}/lib-vc2022")
+        endif()
+    else()
+        if(EXISTS "${GLFW_ROOT}/lib-mingw-w64")
+            target_link_directories(tiny_app PRIVATE "${GLFW_ROOT}/lib-mingw-w64")
+        endif()
+    endif()
+endif()
+
+# Vulkan SDK search paths
+set(VULKAN_ROOT "D:/vulkan" CACHE PATH "Path to Vulkan SDK")
+if(EXISTS "${VULKAN_ROOT}/Include")
+    target_include_directories(tiny_app PRIVATE "${VULKAN_ROOT}/Include")
+endif()
+if(EXISTS "${VULKAN_ROOT}/Lib")
+    target_link_directories(tiny_app PRIVATE "${VULKAN_ROOT}/Lib")
 endif()
 
 # ---- Link libraries & flags ----------------------------------------
 # Windows GUI subsystem.
 if(WIN32 AND GUI_APP)
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    if(MSVC)
+        target_link_options(tiny_app PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+    elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        target_link_options(tiny_app PRIVATE "SHELL:-Xlinker /subsystem:windows" "SHELL:-Xlinker /ENTRY:mainCRTStartup" "SHELL:-Xlinker /DEBUG")
+    elseif(CMAKE_C_COMPILER_ID MATCHES "GNU")
         target_link_options(tiny_app PRIVATE -mwindows)
-    elseif(MSVC)
-        target_link_options(tiny_app PRIVATE /SUBSYSTEM:WINDOWS)
     endif()
 endif()
 
@@ -158,6 +186,7 @@ endif()
 if(WIN32)
     target_link_libraries(tiny_app PRIVATE
             glfw3dll
+            vulkan-1
             opengl32
             gdi32
             user32
@@ -166,9 +195,10 @@ if(WIN32)
             bcrypt
             dbghelp
             winmm
+            ole32
             crypt32
     )
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT (CMAKE_C_SIMULATE_ID STREQUAL "MSVC"))
         target_link_libraries(tiny_app PRIVATE m)
     endif()
 else()
@@ -190,7 +220,7 @@ target_include_directories(vfs_selftest PRIVATE include)
 
 add_executable(cdp_selftest src/mini_cdp_server.c)
 target_compile_definitions(cdp_selftest PRIVATE CDP_SELFTEST)
-target_include_directories(cdp_selftest PRIVATE include)
+target_include_directories(cdp_selftest PRIVATE include libs/quickjs)
 if(WIN32)
     target_link_libraries(cdp_selftest PRIVATE ws2_32)
 endif()

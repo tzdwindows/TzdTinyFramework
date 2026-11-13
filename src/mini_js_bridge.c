@@ -37,6 +37,14 @@
 #include <ctype.h>
 #include <quickjs.h>
 #include <GLFW/glfw3.h>
+#if defined(_WIN32)
+#ifndef WINGDIAPI
+#define WINGDIAPI __declspec(dllimport)
+#endif
+#ifndef APIENTRY
+#define APIENTRY __stdcall
+#endif
+#endif
 #include <GL/gl.h>
 
 /* mingw's <GL/gl.h> is the legacy 1.1 header — define the GL 1.5+ types the
@@ -160,6 +168,8 @@ typedef void *GLsync;
 typedef void (*PFN_m_DisableVA)(GLuint);          /* glDisableVertexAttribArray */
 typedef void (*PFN_m_Flush)(void);
 typedef void (*PFN_m_Finish)(void);
+typedef void *(*PFN_m_MapBuffer)(GLenum, GLenum);
+typedef GLboolean (*PFN_m_UnmapBuffer)(GLenum);
 typedef GLboolean (*PFN_m_IsBuffer)(GLuint);
 typedef GLboolean (*PFN_m_IsProgram)(GLuint);
 typedef GLboolean (*PFN_m_IsShader)(GLuint);
@@ -343,6 +353,8 @@ typedef struct MiniGLBridge
     PFN_m_DisableVA DisableVA;
     PFN_m_Flush Flush;
     PFN_m_Finish Finish;
+    PFN_m_MapBuffer MapBuffer;
+    PFN_m_UnmapBuffer UnmapBuffer;
     PFN_m_IsBuffer IsBuffer;
     PFN_m_IsProgram IsProgram;
     PFN_m_IsShader IsShader;
@@ -457,6 +469,20 @@ typedef struct MiniGLBridge
     GLfloat clear_r, clear_g, clear_b, clear_a;
     int has_clear;
     int unpack_flip_y;
+    /* Vulkan WebGL offscreen FBO compositing state */
+    GLuint vk_fbo;
+    GLuint vk_color_tex;
+    GLuint vk_depth_rb;
+    int vk_fbo_w;
+    int vk_fbo_h;
+    uint8_t *vk_read_buf;
+    GLuint vk_pbo[2];
+    int vk_pbo_idx;
+    int vk_pbo_primed;
+    size_t vk_pbo_bytes;
+    int webgl_drawn;
+    int webgl_dirty;
+    struct MiniNode *webgl_canvas;
 } MiniGLBridge;
 
 void *mini_gl_bridge_new(void)
@@ -510,6 +536,8 @@ void *mini_gl_bridge_new(void)
     R(DeleteShader, "glDeleteShader");
     R(GenerateMipmap, "glGenerateMipmap");
     R(TexSubImage2D, "glTexSubImage2D");
+    R(MapBuffer, "glMapBuffer");
+    R(UnmapBuffer, "glUnmapBuffer");
     R(BlendFunc, "glBlendFunc");
     R(BlendEquation, "glBlendEquation");
     R(BlendFuncSeparate, "glBlendFuncSeparate");
@@ -667,7 +695,258 @@ void *mini_gl_bridge_new(void)
     return b;
 }
 
-void mini_gl_bridge_destroy(void *p) { free(p); }
+void mini_gl_bridge_destroy(void *p)
+{
+    MiniGLBridge *b = (MiniGLBridge *)p;
+    if (b)
+    {
+        if (b->vk_pbo[0] && b->DeleteBuffers)
+            b->DeleteBuffers(2, b->vk_pbo);
+        if (b->vk_read_buf)
+            free(b->vk_read_buf);
+        free(b);
+    }
+}
+
+static void mini_gl_ensure_vk_fbo(MiniGLBridge *gl, int w, int h)
+{
+    if (!gl || !gl->GenFramebuffers || !gl->BindFramebuffer || !gl->FramebufferTexture2D || !gl->GenRenderbuffers || !gl->BindRenderbuffer || !gl->RenderbufferStorage || !gl->FramebufferRenderbuffer)
+        return;
+    if (w < 1) w = 1280;
+    if (h < 1) h = 800;
+    if (w > 2048) w = 2048;
+    if (h > 1024) h = 1024;
+    if (gl->vk_fbo != 0 && gl->vk_fbo_w == w && gl->vk_fbo_h == h)
+        return;
+
+    if (!gl->vk_fbo)
+        gl->GenFramebuffers(1, &gl->vk_fbo);
+    if (!gl->vk_color_tex)
+    {
+        if (gl->GenTextures)
+            gl->GenTextures(1, &gl->vk_color_tex);
+        else
+            glGenTextures(1, &gl->vk_color_tex);
+    }
+    if (!gl->vk_depth_rb)
+        gl->GenRenderbuffers(1, &gl->vk_depth_rb);
+
+    if (gl->BindTexture)
+        gl->BindTexture(0x0DE1 /*GL_TEXTURE_2D*/, gl->vk_color_tex);
+    else
+        glBindTexture(0x0DE1, gl->vk_color_tex);
+    glTexImage2D(0x0DE1, 0, 0x8058 /*GL_RGBA8*/, w, h, 0, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, NULL);
+    glTexParameteri(0x0DE1, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, 0x2601 /*GL_LINEAR*/);
+    glTexParameteri(0x0DE1, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, 0x2601 /*GL_LINEAR*/);
+    if (gl->BindTexture)
+        gl->BindTexture(0x0DE1, gl->last_texture_2d);
+    else
+        glBindTexture(0x0DE1, gl->last_texture_2d);
+
+    gl->BindRenderbuffer(0x8D41 /*GL_RENDERBUFFER*/, gl->vk_depth_rb);
+    gl->RenderbufferStorage(0x8D41, 0x88F0 /*GL_DEPTH24_STENCIL8*/, w, h);
+
+    gl->BindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, gl->vk_fbo);
+    gl->FramebufferTexture2D(0x8D40, 0x8CE0 /*GL_COLOR_ATTACHMENT0*/, 0x0DE1, gl->vk_color_tex, 0);
+    gl->FramebufferRenderbuffer(0x8D40, 0x8D00 /*GL_DEPTH_ATTACHMENT*/, 0x8D41, gl->vk_depth_rb);
+    gl->FramebufferRenderbuffer(0x8D40, 0x8D20 /*GL_STENCIL_ATTACHMENT*/, 0x8D41, gl->vk_depth_rb);
+
+    if (gl->DrawBuffers)
+    {
+        GLenum c0 = 0x8CE0;
+        gl->DrawBuffers(1, &c0);
+    }
+    if (gl->ReadBuffer)
+        gl->ReadBuffer(0x8CE0);
+
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    if (gl->has_clear)
+        glClearColor(gl->clear_r, gl->clear_g, gl->clear_b, gl->clear_a);
+
+    if (gl->current_fbo != 0)
+        gl->BindFramebuffer(0x8D40, gl->current_fbo);
+
+    uint8_t *nb = (uint8_t *)realloc(gl->vk_read_buf, (size_t)w * (size_t)h * 4);
+    if (nb)
+        gl->vk_read_buf = nb;
+    size_t pbo_bytes = (size_t)w * (size_t)h * 4;
+    if (gl->GenBuffers && gl->BindBuffer && gl->BufferData && gl->MapBuffer && gl->UnmapBuffer && gl->vk_pbo_bytes != pbo_bytes)
+    {
+        if (!gl->vk_pbo[0])
+            gl->GenBuffers(2, gl->vk_pbo);
+        for (int i = 0; i < 2; i++)
+        {
+            gl->BindBuffer(0x88EB /*GL_PIXEL_PACK_BUFFER*/, gl->vk_pbo[i]);
+            gl->BufferData(0x88EB, (ptrdiff_t)pbo_bytes, NULL, 0x88E1 /*GL_STREAM_READ*/);
+        }
+        gl->BindBuffer(0x88EB, 0);
+        gl->vk_pbo_bytes = pbo_bytes;
+        gl->vk_pbo_idx = 0;
+        gl->vk_pbo_primed = 0;
+    }
+    gl->vk_fbo_w = w;
+    gl->vk_fbo_h = h;
+}
+
+struct MiniVkContext;
+extern void mini_vk_update_atlas(struct MiniVkContext *vk, int x, int y, int w, int h,
+                                 const uint32_t *src_rgba, int atlas_w, int atlas_h);
+
+void mini_gl_bridge_draw_vk_canvas(MiniRenderer *r, struct MiniNode *canvas_node)
+{
+    if (!r || !r->gpu.is_vulkan || !r->gpu.vk_backend || !r->gl_state || !canvas_node)
+        return;
+    MiniGLBridge *gl = (MiniGLBridge *)r->gl_state;
+    if (!gl->webgl_drawn || !gl->vk_fbo || !gl->vk_read_buf || gl->vk_fbo_w <= 0 || gl->vk_fbo_h <= 0)
+        return;
+    if (gl->webgl_canvas && gl->webgl_canvas != canvas_node)
+        return;
+
+    int w = gl->vk_fbo_w;
+    int h = gl->vk_fbo_h;
+    if (gl->webgl_dirty)
+    {
+        if (gl->BindFramebuffer)
+            gl->BindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, gl->vk_fbo);
+        typedef void (*PFN_glReadBuffer)(GLenum);
+        PFN_glReadBuffer rb = (PFN_glReadBuffer)glfwGetProcAddress("glReadBuffer");
+        if (rb) rb(0x8CE0 /*GL_COLOR_ATTACHMENT0*/); else glReadBuffer(0x8CE0);
+
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+
+        const uint32_t *upload_ptr = NULL;
+        int unmapped_pbo = 0;
+        int did_unpremul = 0;
+        if (gl->vk_pbo[0] && gl->vk_pbo_bytes == (size_t)w * (size_t)h * 4 && gl->BindBuffer && gl->MapBuffer && gl->UnmapBuffer)
+        {
+            int cur = gl->vk_pbo_idx;
+            int prev = 1 - cur;
+            /* Start async DMA readback for this frame into PBO[cur] */
+            gl->BindBuffer(0x88EB /*GL_PIXEL_PACK_BUFFER*/, gl->vk_pbo[cur]);
+            glReadPixels(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, NULL);
+
+            if (gl->vk_pbo_primed)
+            {
+                gl->BindBuffer(0x88EB, gl->vk_pbo[prev]);
+                const uint32_t *mapped = (const uint32_t *)gl->MapBuffer(0x88EB, 0x88B8 /*GL_READ_ONLY*/);
+                if (mapped)
+                {
+                    if (!gl->has_clear || gl->clear_a <= 0.001f)
+                    {
+                        uint32_t *dst = (uint32_t *)gl->vk_read_buf;
+                        size_t count = (size_t)w * (size_t)h;
+                        for (size_t i = 0; i < count; i++)
+                        {
+                            uint32_t c = mapped[i];
+                            uint32_t a = c >> 24;
+                            if (c == 0 || a == 255)
+                            {
+                                dst[i] = c;
+                                continue;
+                            }
+                            uint32_t cr = c & 0xFF;
+                            uint32_t cg = (c >> 8) & 0xFF;
+                            uint32_t cb = (c >> 16) & 0xFF;
+                            uint32_t max_c = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+                            uint32_t a_out = a > max_c ? a : max_c;
+                            if (a_out == 0)
+                            {
+                                dst[i] = 0;
+                                continue;
+                            }
+                            uint32_t r_out = (cr * 255 + (a_out >> 1)) / a_out;
+                            uint32_t g_out = (cg * 255 + (a_out >> 1)) / a_out;
+                            uint32_t b_out = (cb * 255 + (a_out >> 1)) / a_out;
+                            if (r_out > 255) r_out = 255;
+                            if (g_out > 255) g_out = 255;
+                            if (b_out > 255) b_out = 255;
+                            dst[i] = r_out | (g_out << 8) | (b_out << 16) | (a_out << 24);
+                        }
+                        upload_ptr = dst;
+                        did_unpremul = 1;
+                        gl->UnmapBuffer(0x88EB);
+                    }
+                    else
+                    {
+                        upload_ptr = mapped;
+                        unmapped_pbo = 1;
+                    }
+                }
+            }
+            else
+            {
+                /* First frame: synchronous fallback so frame 1 is not blank */
+                gl->BindBuffer(0x88EB, 0);
+                glReadPixels(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, gl->vk_read_buf);
+                upload_ptr = (const uint32_t *)gl->vk_read_buf;
+                gl->vk_pbo_primed = 1;
+            }
+            gl->vk_pbo_idx = prev;
+        }
+        else
+        {
+            glReadPixels(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, gl->vk_read_buf);
+            upload_ptr = (const uint32_t *)gl->vk_read_buf;
+        }
+
+        if (gl->current_fbo != 0 && gl->BindFramebuffer)
+            gl->BindFramebuffer(0x8D40, gl->current_fbo);
+
+        /* When WebGL renders onto a transparent canvas (clear_a <= 0), un-premultiply RGB
+           and preserve additive glow intensity so Vulkan's SRC_ALPHA, ONE_MINUS_SRC_ALPHA
+           pipeline composites both wireframe/translucent meshes and additive particles accurately. */
+        if (!did_unpremul && upload_ptr == (const uint32_t *)gl->vk_read_buf && (!gl->has_clear || gl->clear_a <= 0.001f))
+        {
+            uint32_t *px = (uint32_t *)gl->vk_read_buf;
+            size_t count = (size_t)w * (size_t)h;
+            for (size_t i = 0; i < count; i++)
+            {
+                uint32_t c = px[i];
+                if (c == 0)
+                    continue;
+                uint32_t a = (c >> 24) & 0xFF;
+                if (a == 255)
+                    continue;
+                uint32_t cr = c & 0xFF;
+                uint32_t cg = (c >> 8) & 0xFF;
+                uint32_t cb = (c >> 16) & 0xFF;
+                uint32_t max_c = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+                uint32_t a_out = a > max_c ? a : max_c;
+                if (a_out == 0)
+                {
+                    px[i] = 0;
+                    continue;
+                }
+                uint32_t r_out = (cr * 255 + (a_out >> 1)) / a_out;
+                uint32_t g_out = (cg * 255 + (a_out >> 1)) / a_out;
+                uint32_t b_out = (cb * 255 + (a_out >> 1)) / a_out;
+                if (r_out > 255) r_out = 255;
+                if (g_out > 255) g_out = 255;
+                if (b_out > 255) b_out = 255;
+                px[i] = r_out | (g_out << 8) | (b_out << 16) | (a_out << 24);
+            }
+        }
+
+        if (upload_ptr)
+            mini_vk_update_atlas((struct MiniVkContext *)r->gpu.vk_backend, 0, 1024, w, h,
+                                 upload_ptr, w, h);
+        if (unmapped_pbo)
+        {
+            gl->UnmapBuffer(0x88EB);
+        }
+        if (gl->vk_pbo[0] && gl->BindBuffer)
+            gl->BindBuffer(0x88EB, 0);
+        gl->webgl_dirty = 0;
+    }
+
+    float u0 = 0.0f;
+    float v0 = (1024.0f + (float)h) / 2048.0f;
+    float u1 = (float)w / 2048.0f;
+    float v1 = 1024.0f / 2048.0f;
+    mini_draw_texture(r, canvas_node->style.abs_x, canvas_node->style.abs_y,
+                      canvas_node->style.w, canvas_node->style.h, 1, u0, v0, u1, v1);
+}
 
 /* Reset the GL state the WebGL/3D path leaks back to the fixed-function
    2D default. The renderer's DOM draws use legacy glBegin/glEnd immediate
@@ -739,6 +1018,8 @@ void mini_gl_bridge_restore_webgl(void *state)
         glEnable(0x0C11 /*GL_SCISSOR_TEST*/);
     if (b->has_clear)
         glClearColor(b->clear_r, b->clear_g, b->clear_b, b->clear_a);
+    if (b->vk_fbo && b->current_fbo == 0 && b->BindFramebuffer)
+        b->BindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, b->vk_fbo);
 }
 
 /* ================================================================== */
@@ -770,6 +1051,20 @@ static const char *mini_js_shim =
     "Object.defineProperty(HTMLCanvasElement.prototype, 'height', {\n"
     "  get() { return this._h || Number(this.getAttribute('height')) || window.innerHeight; },\n"
     "  set(v) { this._h = Number(v); this.setAttribute('height', String(v)); }\n"
+    "});\n"
+    "Object.defineProperty(MiniElement.prototype, 'attributes', {\n"
+    "  configurable: true,\n"
+    "  get() {\n"
+    "    var raw = this._getAttributes ? this._getAttributes() : [];\n"
+    "    raw.item = function(i) { return raw[i] || null; };\n"
+    "    raw.getNamedItem = function(name) {\n"
+    "      for (var i = 0; i < raw.length; i++) {\n"
+    "        if (raw[i].name === name) return raw[i];\n"
+    "      }\n"
+    "      return null;\n"
+    "    };\n"
+    "    return raw;\n"
+    "  }\n"
     "});\n"
     "Object.defineProperty(MiniElement.prototype, 'offsetWidth', { configurable:true,\n"
     "  get(){ const r = this.getBoundingClientRect ? this.getBoundingClientRect() : null; return r ? r.width : 0; } });\n"
@@ -1121,7 +1416,7 @@ static const char *mini_js_shim =
 "if(!String.prototype.at) String.prototype.at=function(i){ var n=this.length; i=(i===undefined)?0:Number(i)|0; if(i<0)i+=n; return (i<0||i>=n)?'':this.charAt(i); };\n"
 "if(!Object.hasOwn) Object.hasOwn=function(o,k){ return Object.prototype.hasOwnProperty.call(o,k); };\n"
 "if(typeof crypto==='undefined'){ var _crypto={}; _crypto.getRandomValues=function(a){ for(var i=0;i<a.length;i++){ a[i]=(Math.random()*4294967296)>>>0; } return a; }; _crypto.randomUUID=function(){ var b=new Uint8Array(16); this.getRandomValues(b); b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80; var s=''; for(var i=0;i<16;i++){ var x=b[i].toString(16); s+=(x.length<2?'0'+x:x); if(i===3||i===5||i===7||i===9)s+='-'; } return s; }; _crypto.subtle={ digest:function(){ return Promise.resolve(new ArrayBuffer(0)); }, importKey:function(){ return Promise.resolve({}); }, exportKey:function(){ return Promise.resolve(new ArrayBuffer(0)); }, sign:function(){ return Promise.resolve(new ArrayBuffer(0)); }, verify:function(){ return Promise.resolve(true); }, encrypt:function(){ return Promise.resolve(new ArrayBuffer(0)); }, decrypt:function(){ return Promise.resolve(new ArrayBuffer(0)); }, deriveBits:function(){ return Promise.resolve(new ArrayBuffer(0)); } }; globalThis.crypto=_crypto; window.crypto=_crypto; }\n"
-"if(navigator && !navigator.clipboard) navigator.clipboard={ writeText:function(){ return Promise.resolve(); }, readText:function(){ return Promise.resolve(''); }, read:function(){ return Promise.resolve([]); } };\n"
+"if(navigator && !navigator.clipboard) navigator.clipboard={ writeText:function(t){ t=String(t==null?'':t); window.__miniClipboardText=t; if(window.native&&window.native.clipboard&&window.native.clipboard.writeText) try{ window.native.clipboard.writeText(t); }catch(e){} return Promise.resolve(); }, readText:function(){ if(window.native&&window.native.clipboard&&window.native.clipboard.readText) try{ return Promise.resolve(window.native.clipboard.readText()||''); }catch(e){} return Promise.resolve(window.__miniClipboardText||''); }, read:function(){ return Promise.resolve([]); } };\n"
 "if(!Array.prototype.flat) Array.prototype.flat=function(d){ d=(d===undefined)?1:Number(d)|0; var r=[]; (function E(a){ for(var i=0;i<a.length;i++){ if(Array.isArray(a[i])&&d>0) E(a[i]); else r.push(a[i]); } })(this); return r; };\n"
 "if(!Array.prototype.flatMap) Array.prototype.flatMap=function(cb,ta){ var r=[]; for(var i=0;i<this.length;i++){ var v=cb.call(ta,this[i],i,this); if(Array.isArray(v)) for(var j=0;j<v.length;j++) r.push(v[j]); else r.push(v); } return r; };\n"
 "/* Intl best-effort: QuickJS may not ship full Intl; a React i18n/price app calls new Intl.NumberFormat().format(n) during render. Provide functional stubs so it returns a usable string instead of throwing. */\n"
@@ -1140,7 +1435,9 @@ static const char *mini_js_shim =
 "if (!Array.prototype.at) Array.prototype.at=function(i){ var n=this.length; i=(i===undefined)?0:Number(i)|0; if(i<0)i+=n; return (i<0||i>=n)?undefined:this[i]; };\n"
 "if (!Object.fromEntries) Object.fromEntries = function(a){ var o={}; for(var i=0;i<a.length;i++){ var e=a[i]; o[e[0]]=e[1]; } return o; };\n"
 "MiniElement.prototype.compareDocumentPosition = function(other){ if(this===other) return 0; return 4; /* following*/ };\n"
-"MiniElement.prototype.setSelectionRange = function(){};\n"
+"Object.defineProperty(MiniElement.prototype, 'selectionStart', { configurable:true, get(){ return this._getSelStart ? this._getSelStart() : 0; }, set(v){ if(this._setSelStart) this._setSelStart(Number(v)|0); } });\n"
+"Object.defineProperty(MiniElement.prototype, 'selectionEnd', { configurable:true, get(){ return this._getSelEnd ? this._getSelEnd() : 0; }, set(v){ if(this._setSelEnd) this._setSelEnd(Number(v)|0); } });\n"
+"MiniElement.prototype.select = function(){ var v = this.value || ''; if(this.setSelectionRange) this.setSelectionRange(0, v.length); window.__miniLastSelectedInput = this; if(this.focus) try{ this.focus(); }catch(e){} };\n"
 "MiniElement.prototype.checkValidity = function(){ return true; };\n"
 "MiniElement.prototype.reportValidity = function(){ return true; };\n"
 "MiniElement.prototype.setCustomValidity = function(){};\n"
@@ -1350,7 +1647,21 @@ static const char *mini_js_shim =
     "  window.ResizeObserver = globalThis.ResizeObserver;\n"
     "}\n"
     "if (typeof MutationObserver === 'undefined') {\n"
-    "  globalThis.MutationObserver = class MutationObserver { constructor(cb){ this.cb=cb; } observe(target, opts){} disconnect(){} takeRecords(){ return []; } };\n"
+    "  globalThis.MutationObserver = class MutationObserver {\n"
+    "    constructor(cb){ this.cb=cb; this._active=true; }\n"
+    "    observe(target, opts){\n"
+    "      var self = this;\n"
+    "      setTimeout(function(){\n"
+    "        if (self._active && typeof self.cb === 'function') {\n"
+    "          try {\n"
+    "            self.cb([{ type: 'childList', target: target, addedNodes: (target && target.childNodes) ? Array.from(target.childNodes) : [], removedNodes: [] }], self);\n"
+    "          } catch(e) {}\n"
+    "        }\n"
+    "      }, 0);\n"
+    "    }\n"
+    "    disconnect(){ this._active = false; }\n"
+    "    takeRecords(){ return []; }\n"
+    "  };\n"
     "  window.MutationObserver = globalThis.MutationObserver;\n"
     "}\n"
     "if (typeof IntersectionObserver === 'undefined') {\n"
@@ -1365,9 +1676,49 @@ static const char *mini_js_shim =
     "if (typeof document.fonts === 'undefined') {\n"
     "  document.fonts = { ready: Promise.resolve(), check: function(){ return true; }, load: function(){ return Promise.resolve([]); }, addEventListener: function(){}, removeEventListener: function(){} };\n"
     "}\n"
-    "document.queryCommandSupported = function(c){ return false; };\n"
-    "document.queryCommandEnabled = function(c){ return false; };\n"
-    "document.execCommand = function(c,u,v){ return false; };\n"
+    "document.queryCommandSupported = function(c){ c=String(c||'').toLowerCase(); return c==='copy'||c==='cut'||c==='paste'||c==='selectall'; };\n"
+    "document.queryCommandEnabled = function(c){ return document.queryCommandSupported(c); };\n"
+    "document.execCommand = function(c,u,v){\n"
+    "  c = String(c||'').toLowerCase();\n"
+    "  var ae = document.activeElement;\n"
+    "  var isInp = ae && (ae.tagName==='INPUT'||ae.tagName==='TEXTAREA');\n"
+    "  if (!isInp && window.__miniLastSelectedInput && (window.__miniLastSelectedInput.tagName==='INPUT'||window.__miniLastSelectedInput.tagName==='TEXTAREA')) { ae = window.__miniLastSelectedInput; isInp = true; }\n"
+    "  if (c === 'copy') {\n"
+    "    var txt = '';\n"
+    "    if (isInp) { var a = ae.selectionStart||0, b = ae.selectionEnd||0; if (b > a && ae.value) txt = ae.value.substring(a, b); }\n"
+    "    if (!txt && window.getSelection) txt = window.getSelection().toString();\n"
+    "    if (txt) { if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt); return true; }\n"
+    "    return false;\n"
+    "  }\n"
+    "  if (c === 'cut' && isInp) {\n"
+    "    var a = ae.selectionStart||0, b = ae.selectionEnd||0, val = ae.value||'';\n"
+    "    if (b > a) {\n"
+    "      var txt = val.substring(a, b);\n"
+    "      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt);\n"
+    "      ae.value = val.slice(0, a) + val.slice(b);\n"
+    "      if (ae.setSelectionRange) ae.setSelectionRange(a, a);\n"
+    "      ae.dispatchEvent(new Event('input', {bubbles:true}));\n"
+    "      return true;\n"
+    "    }\n"
+    "    return false;\n"
+    "  }\n"
+    "  if (c === 'paste' && isInp) {\n"
+    "    var txt = (window.native && window.native.clipboard && window.native.clipboard.readText) ? (window.native.clipboard.readText()||'') : (window.__miniClipboardText||'');\n"
+    "    if (txt) {\n"
+    "      var a = ae.selectionStart||0, b = ae.selectionEnd||0, val = ae.value||'';\n"
+    "      ae.value = val.slice(0, a) + txt + val.slice(b);\n"
+    "      if (ae.setSelectionRange) ae.setSelectionRange(a + txt.length, a + txt.length);\n"
+    "      ae.dispatchEvent(new Event('input', {bubbles:true}));\n"
+    "      return true;\n"
+    "    }\n"
+    "    return false;\n"
+    "  }\n"
+    "  if (c === 'selectall') {\n"
+    "    if (isInp && ae.select) { ae.select(); return true; }\n"
+    "    return false;\n"
+    "  }\n"
+    "  return false;\n"
+    "};\n"
     "if(typeof MiniDocument!=='undefined'){\n"
     "  MiniDocument.prototype.queryCommandSupported = document.queryCommandSupported;\n"
     "  MiniDocument.prototype.queryCommandEnabled = document.queryCommandEnabled;\n"
@@ -1438,6 +1789,49 @@ static const char *mini_js_shim =
     "window.MessageChannel=MessageChannel;\n"
     /* document.head: live query (the DOM may parse after the shim runs). */
     "Object.defineProperty(document, 'head', { configurable:true, get:function(){ return document.querySelector('head'); } });\n"
+    "Object.defineProperty(document, 'defaultView', { configurable:true, get:function(){ return window; } });\n"
+    "if(typeof MiniDocument!=='undefined') Object.defineProperty(MiniDocument.prototype, 'defaultView', { configurable:true, get:function(){ return window; } });\n"
+    "document.compatMode = 'CSS1Compat';\n"
+    "function XMLSerializer(){}\n"
+    "XMLSerializer.prototype.serializeToString = function(n){ if(!n)return ''; if(typeof n.outerHTML==='string')return n.outerHTML; if(typeof n.innerHTML==='string')return n.innerHTML; return String(n.textContent||''); };\n"
+    "window.XMLSerializer = XMLSerializer; globalThis.XMLSerializer = XMLSerializer;\n"
+    "function DOMParser(){}\n"
+    "DOMParser.prototype.parseFromString = function(s, m){\n"
+    "  var div = document.createElement('div'); div.innerHTML = String(s||'');\n"
+    "  var d = { nodeType:9, nodeName:'#document', defaultView:window, documentElement:null, head:null, body:null,\n"
+    "    createElement:function(t){ return document.createElement(t); }, createTextNode:function(t){ return document.createTextNode(t); },\n"
+    "    querySelector:function(q){ return this.documentElement ? this.documentElement.querySelector(q) : null; },\n"
+    "    querySelectorAll:function(q){ return this.documentElement ? this.documentElement.querySelectorAll(q) : []; },\n"
+    "    getElementById:function(i){ return this.documentElement ? this.documentElement.querySelector('#'+i) : null; },\n"
+    "    getElementsByTagName:function(t){ return this.documentElement ? this.documentElement.getElementsByTagName(t) : []; },\n"
+    "    getElementsByClassName:function(c){ return this.documentElement ? this.documentElement.getElementsByClassName(c) : []; }\n"
+    "  };\n"
+    "  if (m === 'image/svg+xml') { d.documentElement = div.querySelector('svg') || div.firstElementChild || div; }\n"
+    "  else {\n"
+    "    var h = div.querySelector('html');\n"
+    "    if (h) { d.documentElement = h; d.head = h.querySelector('head'); d.body = h.querySelector('body'); }\n"
+    "    else {\n"
+    "      d.body = document.createElement('body'); while (div.firstChild) d.body.appendChild(div.firstChild);\n"
+    "      d.head = document.createElement('head'); d.documentElement = document.createElement('html');\n"
+    "      d.documentElement.appendChild(d.head); d.documentElement.appendChild(d.body);\n"
+    "    }\n"
+    "  }\n"
+    "  return d;\n"
+    "};\n"
+    "window.DOMParser = DOMParser; globalThis.DOMParser = DOMParser;\n"
+    "if (!document.implementation) {\n"
+    "  document.implementation = {\n"
+    "    hasFeature: function(){ return true; },\n"
+    "    createHTMLDocument: function(title){ return new DOMParser().parseFromString('<!DOCTYPE html><html><head><title>'+(title||'')+'</title></head><body></body></html>', 'text/html'); },\n"
+    "    createDocument: function(ns, name){ return new DOMParser().parseFromString('<'+(name||'root')+'/>', 'text/xml'); }\n"
+    "  };\n"
+    "}\n"
+    "if (!HTMLCanvasElement.prototype.toDataURL) {\n"
+    "  HTMLCanvasElement.prototype.toDataURL = function(){ return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='; };\n"
+    "}\n"
+    "if (!HTMLCanvasElement.prototype.toBlob) {\n"
+    "  HTMLCanvasElement.prototype.toBlob = function(cb, type){ if(typeof cb==='function') setTimeout(function(){ cb(new Blob([],{type:type||'image/png'})); }, 0); };\n"
+    "}\n"
     "Object.defineProperty(document, 'pointerLockElement', { configurable:true, get:function(){ return typeof this._pointerLockElement === 'function' ? this._pointerLockElement() : null; } });\n"
     "MiniElement.prototype.requestPointerLock = function(){ if (typeof this._requestPointerLock === 'function') this._requestPointerLock(); };\n"
     "MiniDocument.prototype.exitPointerLock = function(){ if (typeof this._exitPointerLock === 'function') this._exitPointerLock(); };\n"
@@ -1558,22 +1952,127 @@ static const char *mini_js_shim =
     "/* Web Audio API standard polyfill */\n"
     "(function(){\n"
     "  if(typeof window==='undefined'||window.AudioContext||window.webkitAudioContext) return;\n"
-    "  function AudioParam(defVal){ this.value = (defVal!==undefined)?defVal:0; this._events=[]; }\n"
-    "  AudioParam.prototype.setValueAtTime = function(v, t){ this.value=v; this._events.push({type:'set', value:v, time:t}); return this; };\n"
-    "  AudioParam.prototype.linearRampToValueAtTime = function(v, t){ this._events.push({type:'linear', value:v, time:t}); return this; };\n"
-    "  AudioParam.prototype.exponentialRampToValueAtTime = function(v, t){ this._events.push({type:'exp', value:v, time:t}); return this; };\n"
-    "  AudioParam.prototype._valAt = function(t){\n"
-    "    var v = this.value;\n"
-    "    for(var i=0; i<this._events.length; i++){\n"
-    "      var ev = this._events[i];\n"
-    "      if(t >= ev.time) v = ev.value;\n"
-    "      else if(ev.type==='linear' && i>0){\n"
-    "        var prev = this._events[i-1];\n"
-    "        if(t >= prev.time && t < ev.time){\n"
-    "          var frac = (t - prev.time)/(ev.time - prev.time);\n"
-    "          v = prev.value + (ev.value - prev.value) * frac;\n"
-    "        }\n"
+    "  function AudioParam(defVal, ctx){ this.defaultValue = (defVal!==undefined)?defVal:0; this.value = this.defaultValue; this._events=[]; this._inputs=[]; this._ctx = ctx || null; }\n"
+    "  AudioParam.prototype._pushEvent = function(ev){\n"
+    "    this._events.push(ev);\n"
+    "    if(this._events.length > 1 && ev.time < this._events[this._events.length - 2].time){\n"
+    "      this._events.sort(function(a,b){ return a.time - b.time; });\n"
+    "    }\n"
+    "    if(this._events.length > 24 && this._ctx){\n"
+    "      var cutoff = Math.max(0, this._ctx.currentTime - 0.5);\n"
+    "      var keep = [];\n"
+    "      var hasPast = false;\n"
+    "      for(var i=0; i<this._events.length; i++){\n"
+    "        if(this._events[i].time < cutoff) hasPast = true;\n"
+    "        else keep.push(this._events[i]);\n"
     "      }\n"
+    "      if(hasPast && keep.length < this._events.length){\n"
+    "        this.value = this._baseValAt(cutoff);\n"
+    "        this._events = keep;\n"
+    "      }\n"
+    "    }\n"
+    "  };\n"
+    "  AudioParam.prototype.setValueAtTime = function(v, t){ t = t||0; if(t<=0) this.value=v; this._pushEvent({type:'set', value:v, time:t}); return this; };\n"
+    "  AudioParam.prototype.linearRampToValueAtTime = function(v, t){ this._pushEvent({type:'linear', value:v, time:t||0}); return this; };\n"
+    "  AudioParam.prototype.exponentialRampToValueAtTime = function(v, t){ this._pushEvent({type:'exp', value:v, time:t||0}); return this; };\n"
+    "  AudioParam.prototype.setTargetAtTime = function(target, startTime, timeConstant){ this._pushEvent({type:'target', value:target, time:startTime||0, tc:Math.max(0.0005, timeConstant||0.01)}); return this; };\n"
+    "  AudioParam.prototype.setValueCurveAtTime = function(values, startTime, duration){ this._pushEvent({type:'curve', values:values, time:startTime||0, duration:Math.max(0.0001, duration||0.01)}); return this; };\n"
+    "  AudioParam.prototype.cancelScheduledValues = function(cancelTime){ if(this._events) this._events = this._events.filter(function(e){ return e.time < cancelTime; }); return this; };\n"
+    "  AudioParam.prototype.cancelAndHoldAtTime = function(cancelTime){\n"
+    "    var held = this._baseValAt(cancelTime);\n"
+    "    this.cancelScheduledValues(cancelTime);\n"
+    "    this._pushEvent({type:'set', value:held, time:cancelTime});\n"
+    "    return this;\n"
+    "  };\n"
+    "  AudioParam.prototype.defaultValue = 0;\n"
+    "  AudioParam.prototype.minValue = -3.4028235e38;\n"
+    "  AudioParam.prototype.maxValue = 3.4028235e38;\n"
+    "  AudioParam.prototype._baseValAt = function(t){\n"
+    "    var v = this.value;\n"
+    "    var prevTime = 0;\n"
+    "    var evs = this._events;\n"
+    "    for(var i=0; i<evs.length; i++){\n"
+    "      var ev = evs[i];\n"
+    "      if(ev.type==='curve' && ev.values && ev.values.length){\n"
+    "        if(t >= ev.time && t <= ev.time + ev.duration){\n"
+    "          var cf = (t - ev.time) / ev.duration;\n"
+    "          var idx = Math.min(ev.values.length - 1, Math.max(0, Math.floor(cf * (ev.values.length - 1))));\n"
+    "          return ev.values[idx];\n"
+    "        } else if(t > ev.time + ev.duration){\n"
+    "          v = ev.values[ev.values.length - 1];\n"
+    "          prevTime = ev.time + ev.duration;\n"
+    "        } else break;\n"
+    "      } else if(ev.type==='target'){\n"
+    "        if(t >= ev.time){\n"
+    "          var tEnd = (i + 1 < evs.length && evs[i + 1].time < t) ? evs[i + 1].time : t;\n"
+    "          var dtT = Math.max(0, tEnd - ev.time);\n"
+    "          v = ev.value + (v - ev.value) * Math.exp(-dtT / ev.tc);\n"
+    "          prevTime = tEnd;\n"
+    "        } else break;\n"
+    "      } else if(ev.type==='linear' || ev.type==='exp'){\n"
+    "        if(t >= ev.time){\n"
+    "          v = ev.value;\n"
+    "          prevTime = ev.time;\n"
+    "        } else {\n"
+    "          var t0 = (i>0) ? Math.max(prevTime, evs[i-1].time) : prevTime;\n"
+    "          if(t > t0){\n"
+    "            var frac = (t - t0) / Math.max(0.0001, ev.time - t0);\n"
+    "            if(ev.type==='exp' && v > 1e-5 && ev.value > 1e-5)\n"
+    "              return v * Math.pow(ev.value / v, frac);\n"
+    "            return v + (ev.value - v) * frac;\n"
+    "          }\n"
+    "          break;\n"
+    "        }\n"
+    "      } else {\n"
+    "        if(t >= ev.time){ v = ev.value; prevTime = ev.time; }\n"
+    "        else break;\n"
+    "      }\n"
+    "    }\n"
+    "    return v;\n"
+    "  };\n"
+    "  function _evalModInput(node, t, sr, depth){\n"
+    "    if(!node || (depth||0) > 8) return 0.0;\n"
+    "    if(node instanceof ConstantSourceNode){\n"
+    "      if(node.startTime >= 0 && t >= node.startTime && (node.stopTime < 0 || t < node.stopTime)){\n"
+    "        return node.offset._valAt(t);\n"
+    "      }\n"
+    "      return 0.0;\n"
+    "    }\n"
+    "    if(node instanceof OscillatorNode){\n"
+    "      if(node.startTime >= 0 && t >= node.startTime && (node.stopTime < 0 || t < node.stopTime)){\n"
+    "        if(node._lastModT !== t){\n"
+    "          var f = Math.max(0.001, Math.min(sr * 0.45, node.frequency._valAt(t)));\n"
+    "          var dtM = (node._lastModT !== undefined) ? Math.max(0, t - node._lastModT) : (1.0 / sr);\n"
+    "          node._phase = (node._phase + 2.0 * Math.PI * f * dtM) % (2.0 * Math.PI);\n"
+    "          node._lastModT = t;\n"
+    "        }\n"
+    "        var p = node._phase;\n"
+    "        if(node.type==='square') return (p < Math.PI) ? 1.0 : -1.0;\n"
+    "        if(node.type==='sawtooth') return (p / Math.PI) - 1.0;\n"
+    "        if(node.type==='triangle') return 1.0 - 2.0 * Math.abs((p / Math.PI) - 1.0);\n"
+    "        return Math.sin(p);\n"
+    "      }\n"
+    "      return 0.0;\n"
+    "    }\n"
+    "    if(node instanceof GainNode){\n"
+    "      var sum = 0.0;\n"
+    "      if(node._inNodes){\n"
+    "        for(var i=0; i<node._inNodes.length; i++) sum += _evalModInput(node._inNodes[i], t, sr, (depth||0)+1);\n"
+    "      }\n"
+    "      return sum * node.gain._valAt(t);\n"
+    "    }\n"
+    "    if(node._inNodes && node._inNodes.length){\n"
+    "      var s = 0.0;\n"
+    "      for(var j=0; j<node._inNodes.length; j++) s += _evalModInput(node._inNodes[j], t, sr, (depth||0)+1);\n"
+    "      return s;\n"
+    "    }\n"
+    "    return 0.0;\n"
+    "  }\n"
+    "  AudioParam.prototype._valAt = function(t){\n"
+    "    var v = this._baseValAt(t);\n"
+    "    if(this._inputs && this._inputs.length){\n"
+    "      var sr = (this._ctx && this._ctx.sampleRate) ? this._ctx.sampleRate : 44100;\n"
+    "      for(var i=0; i<this._inputs.length; i++) v += _evalModInput(this._inputs[i], t, sr, 0);\n"
     "    }\n"
     "    return v;\n"
     "  };\n"
@@ -1582,91 +2081,381 @@ static const char *mini_js_shim =
     "    for(var i=0; i<this.numberOfChannels; i++) this._channels.push(new Float32Array(this.length));\n"
     "  }\n"
     "  AudioBuffer.prototype.getChannelData = function(ch){ return this._channels[ch||0]; };\n"
-    "  function AudioNode(ctx){ this.context = ctx; this._connections = []; }\n"
-    "  AudioNode.prototype.connect = function(dest){ if(this._connections.indexOf(dest)===-1) this._connections.push(dest); return dest; };\n"
-    "  AudioNode.prototype.disconnect = function(){ this._connections = []; };\n"
-    "  function GainNode(ctx){ AudioNode.call(this, ctx); this.gain = new AudioParam(1.0); }\n"
+        "  function AudioNode(ctx){ this.context = ctx; this._connections = []; this._inNodes = []; this._paramTargets = []; this.channelCount = 2; this.channelCountMode = 'max'; this.channelInterpretation = 'speakers'; this.numberOfInputs = 1; this.numberOfOutputs = 1; }\n"
+    "  AudioNode.prototype.connect = function(dest){\n"
+    "    if(!dest) return dest;\n"
+    "    if(dest instanceof AudioParam){\n"
+    "      if(dest._inputs.indexOf(this)===-1) dest._inputs.push(this);\n"
+    "      if(this._paramTargets.indexOf(dest)===-1) this._paramTargets.push(dest);\n"
+    "      return dest;\n"
+    "    }\n"
+    "    if(this._connections.indexOf(dest)===-1) this._connections.push(dest);\n"
+    "    if(dest._inNodes && dest._inNodes.indexOf(this)===-1) dest._inNodes.push(this);\n"
+    "    return dest;\n"
+    "  };\n"
+    "  AudioNode.prototype.disconnect = function(dest){\n"
+    "    var self = this;\n"
+    "    if(dest){\n"
+    "      this._connections = this._connections.filter(function(x){ return x !== dest; });\n"
+    "      if(dest._inNodes) dest._inNodes = dest._inNodes.filter(function(x){ return x !== self; });\n"
+    "      if(dest instanceof AudioParam){ dest._inputs = dest._inputs.filter(function(x){ return x !== self; }); }\n"
+    "      return;\n"
+    "    }\n"
+    "    for(var i=0; i<this._connections.length; i++){ var c=this._connections[i]; if(c && c._inNodes) c._inNodes = c._inNodes.filter(function(x){ return x !== self; }); }\n"
+    "    for(var j=0; j<this._paramTargets.length; j++){ var p=this._paramTargets[j]; if(p && p._inputs) p._inputs = p._inputs.filter(function(x){ return x !== self; }); }\n"
+    "    this._connections = []; this._paramTargets = [];\n"
+    "  };\n"
+    "  AudioNode.prototype.channelCount = 2;\n"
+    "  AudioNode.prototype.channelCountMode = 'max';\n"
+    "  AudioNode.prototype.channelInterpretation = 'speakers';\n"
+    "  AudioNode.prototype.numberOfInputs = 1;\n"
+    "  AudioNode.prototype.numberOfOutputs = 1;\n"
+    "  function GainNode(ctx){ AudioNode.call(this, ctx); this.gain = new AudioParam(1.0, ctx); }\n"
     "  GainNode.prototype = Object.create(AudioNode.prototype);\n"
-    "  function BiquadFilterNode(ctx){ AudioNode.call(this, ctx); this.type = 'lowpass'; this.frequency = new AudioParam(350); this.Q = new AudioParam(1); this.gain = new AudioParam(0); }\n"
+    "  function BiquadFilterNode(ctx){ AudioNode.call(this, ctx); this.type = 'lowpass'; this.frequency = new AudioParam(350, ctx); this.detune = new AudioParam(0, ctx); this.Q = new AudioParam(1, ctx); this.gain = new AudioParam(0, ctx); this._x1=0; this._x2=0; this._y1=0; this._y2=0; this._bstate = new Float32Array(4); this._bstates = {}; }\n"
     "  BiquadFilterNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  BiquadFilterNode.prototype._process = function(x, t, sr){\n"
+    "    var f0 = Math.min(sr * 0.45, Math.max(10, this.frequency._valAt(t) * Math.pow(2, this.detune._valAt(t)/1200.0)));\n"
+    "    var q = Math.max(0.01, this.Q._valAt(t));\n"
+    "    var w0 = 2.0 * Math.PI * f0 / sr;\n"
+    "    var cosW = Math.cos(w0), sinW = Math.sin(w0);\n"
+    "    var alpha = sinW / (2.0 * q);\n"
+    "    var b0=1, b1=0, b2=0, a0=1, a1=0, a2=0;\n"
+    "    var tp = this.type;\n"
+    "    if(tp==='lowpass'){ b0=(1-cosW)/2; b1=1-cosW; b2=b0; a0=1+alpha; a1=-2*cosW; a2=1-alpha; }\n"
+    "    else if(tp==='highpass'){ b0=(1+cosW)/2; b1=-(1+cosW); b2=b0; a0=1+alpha; a1=-2*cosW; a2=1-alpha; }\n"
+    "    else if(tp==='bandpass'){ b0=alpha; b1=0; b2=-alpha; a0=1+alpha; a1=-2*cosW; a2=1-alpha; }\n"
+    "    else if(tp==='notch'){ b0=1; b1=-2*cosW; b2=1; a0=1+alpha; a1=-2*cosW; a2=1-alpha; }\n"
+    "    else if(tp==='allpass'){ b0=1-alpha; b1=-2*cosW; b2=1+alpha; a0=1+alpha; a1=-2*cosW; a2=1-alpha; }\n"
+    "    else { return x; }\n"
+    "    var y = (b0/a0)*x + (b1/a0)*this._x1 + (b2/a0)*this._x2 - (a1/a0)*this._y1 - (a2/a0)*this._y2;\n"
+    "    if(!isFinite(y)) y = 0;\n"
+    "    this._x2 = this._x1; this._x1 = x; this._y2 = this._y1; this._y1 = y;\n"
+    "    return y;\n"
+    "  };\n"
+    "  var _oscUid = 1;\n"
     "  function OscillatorNode(ctx){\n"
-    "    AudioNode.call(this, ctx); this.type = 'sine'; this.frequency = new AudioParam(440); this.detune = new AudioParam(0);\n"
-    "    this.startTime = -1; this.stopTime = -1; this._phase = 0; this.context._activeSources.push(this);\n"
+    "    AudioNode.call(this, ctx); this.type = 'sine'; this.frequency = new AudioParam(440, ctx); this.detune = new AudioParam(0, ctx);\n"
+    "    this.startTime = -1; this.stopTime = -1; this._phase = 0; this._ended = false; this._uid = _oscUid++; this.context._activeSources.push(this);\n"
     "  }\n"
     "  OscillatorNode.prototype = Object.create(AudioNode.prototype);\n"
     "  OscillatorNode.prototype.start = function(when){ this.startTime = (when!==undefined)?when:this.context.currentTime; };\n"
     "  OscillatorNode.prototype.stop = function(when){ this.stopTime = (when!==undefined)?when:this.context.currentTime; };\n"
     "  function AudioBufferSourceNode(ctx){\n"
-    "    AudioNode.call(this, ctx); this.buffer = null; this.playbackRate = new AudioParam(1.0); this.loop = false; this.loopStart = 0; this.loopEnd = 0;\n"
-    "    this.startTime = -1; this.stopTime = -1; this._offset = 0; this.context._activeSources.push(this);\n"
+    "    AudioNode.call(this, ctx); this.buffer = null; this.playbackRate = new AudioParam(1.0, ctx); this.detune = new AudioParam(0, ctx); this.loop = false; this.loopStart = 0; this.loopEnd = 0;\n"
+    "    this.startTime = -1; this.stopTime = -1; this._offset = 0; this._ended = false; this.context._activeSources.push(this);\n"
     "  }\n"
     "  AudioBufferSourceNode.prototype = Object.create(AudioNode.prototype);\n"
-    "  AudioBufferSourceNode.prototype.start = function(when, offset){ this.startTime = (when!==undefined)?when:this.context.currentTime; this._offset = offset || 0; };\n"
+    "  AudioBufferSourceNode.prototype.start = function(when, offset, duration){\n"
+    "    this.startTime = (when!==undefined)?when:this.context.currentTime;\n"
+    "    var sr = (this.buffer && this.buffer.sampleRate) ? this.buffer.sampleRate : this.context.sampleRate;\n"
+    "    this._offset = (offset || 0) * sr;\n"
+    "    if(duration !== undefined && duration >= 0) this.stopTime = this.startTime + duration;\n"
+    "  };\n"
     "  AudioBufferSourceNode.prototype.stop = function(when){ this.stopTime = (when!==undefined)?when:this.context.currentTime; };\n"
+    "  function ConstantSourceNode(ctx){\n"
+    "    AudioNode.call(this, ctx); this.offset = new AudioParam(1.0, ctx); this.startTime = -1; this.stopTime = -1; this.context._activeSources.push(this);\n"
+    "  }\n"
+    "  ConstantSourceNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  ConstantSourceNode.prototype.start = function(when){ this.startTime = (when!==undefined)?when:this.context.currentTime; };\n"
+    "  ConstantSourceNode.prototype.stop = function(when){ this.stopTime = (when!==undefined)?when:this.context.currentTime; };\n"
+    "  function AnalyserNode(ctx){\n"
+    "    AudioNode.call(this, ctx); this.fftSize = 2048; this.frequencyBinCount = 1024; this.minDecibels = -100; this.maxDecibels = -30; this.smoothingTimeConstant = 0.8;\n"
+    "  }\n"
+    "  AnalyserNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  AnalyserNode.prototype.getByteFrequencyData = function(arr){ if(arr) arr.fill(0); };\n"
+    "  AnalyserNode.prototype.getByteTimeDomainData = function(arr){ if(arr) arr.fill(128); };\n"
+    "  AnalyserNode.prototype.getFloatFrequencyData = function(arr){ if(arr) arr.fill(-100); };\n"
+    "  AnalyserNode.prototype.getFloatTimeDomainData = function(arr){ if(arr) arr.fill(0); };\n"
+    "  function DelayNode(ctx){ AudioNode.call(this, ctx); this.delayTime = new AudioParam(0); }\n"
+    "  DelayNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  function ConvolverNode(ctx){ AudioNode.call(this, ctx); this.buffer = null; this.normalize = true; }\n"
+    "  ConvolverNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  function DynamicsCompressorNode(ctx){\n"
+    "    AudioNode.call(this, ctx); this.threshold = new AudioParam(-24); this.knee = new AudioParam(30); this.ratio = new AudioParam(12); this.attack = new AudioParam(0.003); this.release = new AudioParam(0.25); this.reduction = 0;\n"
+    "  }\n"
+    "  DynamicsCompressorNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  function WaveShaperNode(ctx){ AudioNode.call(this, ctx); this.curve = null; this.oversample = 'none'; }\n"
+    "  WaveShaperNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  function StereoPannerNode(ctx){ AudioNode.call(this, ctx); this.pan = new AudioParam(0); }\n"
+    "  StereoPannerNode.prototype = Object.create(AudioNode.prototype);\n"
+    "  function PannerNode(ctx){\n"
+    "    AudioNode.call(this, ctx); this.panningModel = 'equalpower'; this.distanceModel = 'inverse'; this.refDistance = 1; this.maxDistance = 10000; this.rolloffFactor = 1; this.coneInnerAngle = 360; this.coneOuterAngle = 360; this.coneOuterGain = 0;\n"
+    "    this.positionX = new AudioParam(0); this.positionY = new AudioParam(0); this.positionZ = new AudioParam(0);\n"
+    "    this.orientationX = new AudioParam(1); this.orientationY = new AudioParam(0); this.orientationZ = new AudioParam(0);\n"
+    "  }\n"
+    "  PannerNode.prototype = Object.create(AudioNode.prototype);\n"
     "  function AudioDestinationNode(ctx){ AudioNode.call(this, ctx); }\n"
     "  AudioDestinationNode.prototype = Object.create(AudioNode.prototype);\n"
-    "  function AudioContext(){\n"
-    "    this.sampleRate = 44100; this.currentTime = 0; this.state = 'running'; this.destination = new AudioDestinationNode(this); this._activeSources = [];\n"
-    "    var self = this;\n"
-    "    if(typeof __mini_audio_init === 'function') __mini_audio_init(this.sampleRate, 1);\n"
-    "    this._timer = setInterval(function(){ self._tick(); }, 30);\n"
+    "  AudioDestinationNode.prototype.maxChannelCount = 2;\n"
+    "  var _eventTargetMixin = {\n"
+    "    addEventListener: function(t, cb){\n"
+    "      if(!this._evs) this._evs = {};\n"
+    "      (this._evs[t] = this._evs[t] || []).push(cb);\n"
+    "      if(t === 'statechange' && this.state === 'running'){\n"
+    "        var self = this;\n"
+    "        try { cb.call(self, { type: 'statechange', target: self }); } catch(_) {}\n"
+    "      }\n"
+    "    },\n"
+    "    removeEventListener: function(t, cb){\n"
+    "      if(!this._evs || !this._evs[t]) return;\n"
+    "      this._evs[t] = this._evs[t].filter(function(x){ return x !== cb; });\n"
+    "    },\n"
+    "    dispatchEvent: function(ev){\n"
+    "      var t = (ev && ev.type) ? ev.type : String(ev);\n"
+    "      if(!ev.target) ev.target = this;\n"
+    "      if(this._evs && this._evs[t]){\n"
+    "        var list = this._evs[t].slice(0);\n"
+    "        for(var i=0; i<list.length; i++){\n"
+    "          try { list[i].call(this, ev); } catch(_) {}\n"
+    "        }\n"
+    "      }\n"
+    "      var h = this['on' + t];\n"
+    "      if(typeof h === 'function'){\n"
+    "        try { h.call(this, ev); } catch(_) {}\n"
+    "      }\n"
+    "      return true;\n"
+    "    }\n"
+    "  };\n"
+    "  Object.assign(AudioNode.prototype, _eventTargetMixin);\n"
+    "  function AudioListener(){\n"
+    "    this.forwardX = new AudioParam(0); this.forwardY = new AudioParam(0); this.forwardZ = new AudioParam(-1);\n"
+    "    this.upX = new AudioParam(0); this.upY = new AudioParam(1); this.upZ = new AudioParam(0);\n"
+    "    this.positionX = new AudioParam(0); this.positionY = new AudioParam(0); this.positionZ = new AudioParam(0);\n"
     "  }\n"
-    "  AudioContext.prototype.resume = function(){ this.state='running'; return Promise.resolve(); };\n"
-    "  AudioContext.prototype.suspend = function(){ this.state='suspended'; return Promise.resolve(); };\n"
-    "  AudioContext.prototype.close = function(){ this.state='closed'; if(this._timer) clearInterval(this._timer); return Promise.resolve(); };\n"
+    "  AudioListener.prototype.forwardX = new AudioParam(0);\n"
+    "  AudioListener.prototype.forwardY = new AudioParam(0);\n"
+    "  AudioListener.prototype.forwardZ = new AudioParam(-1);\n"
+    "  AudioListener.prototype.upX = new AudioParam(0);\n"
+    "  AudioListener.prototype.upY = new AudioParam(1);\n"
+    "  AudioListener.prototype.upZ = new AudioParam(0);\n"
+    "  AudioListener.prototype.positionX = new AudioParam(0);\n"
+    "  AudioListener.prototype.positionY = new AudioParam(0);\n"
+    "  AudioListener.prototype.positionZ = new AudioParam(0);\n"
+    "  AudioListener.prototype.setPosition = function(x,y,z){};\n"
+    "  AudioListener.prototype.setOrientation = function(x,y,z,xu,yu,zu){};\n"
+    "  function AudioContext(){\n"
+    "    this.sampleRate = 44100; this.currentTime = 0; this.state = 'running'; this.destination = new AudioDestinationNode(this); this.listener = new AudioListener(); this._activeSources = [];\n"
+    "    var self = this;\n"
+    "    this._lastTickMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();\n"
+    "    if(typeof __mini_audio_init === 'function') __mini_audio_init(this.sampleRate, 1);\n"
+    "    this._timer = setInterval(function(){ self._tick(); }, 16);\n"
+    "  }\n"
+    "  AudioContext.prototype.state = 'running';\n"
+    "  AudioContext.prototype.listener = new AudioListener();\n"
+    "  AudioContext.prototype.resume = function(){\n"
+    "    this.state = 'running';\n"
+    "    var ev = { type: 'statechange', target: this };\n"
+    "    this.dispatchEvent(ev);\n"
+    "    return Promise.resolve();\n"
+    "  };\n"
+    "  AudioContext.prototype.suspend = function(){\n"
+    "    this.state = 'suspended';\n"
+    "    var ev = { type: 'statechange', target: this };\n"
+    "    this.dispatchEvent(ev);\n"
+    "    return Promise.resolve();\n"
+    "  };\n"
+    "  AudioContext.prototype.close = function(){\n"
+    "    this.state = 'closed';\n"
+    "    if(this._timer) clearInterval(this._timer);\n"
+    "    var ev = { type: 'statechange', target: this };\n"
+    "    this.dispatchEvent(ev);\n"
+    "    return Promise.resolve();\n"
+    "  };\n"
     "  AudioContext.prototype.createOscillator = function(){ return new OscillatorNode(this); };\n"
     "  AudioContext.prototype.createGain = function(){ return new GainNode(this); };\n"
     "  AudioContext.prototype.createBuffer = function(c,l,s){ return new AudioBuffer(c, l, s||this.sampleRate); };\n"
     "  AudioContext.prototype.createBufferSource = function(){ return new AudioBufferSourceNode(this); };\n"
     "  AudioContext.prototype.createBiquadFilter = function(){ return new BiquadFilterNode(this); };\n"
+    "  AudioContext.prototype.decodeAudioData = function(b,s,e){ var ab = new AudioBuffer(2, 44100, 44100); if(s) s(ab); return Promise.resolve(ab); };\n"
+    "  AudioContext.prototype.createPeriodicWave = function(){ return {}; };\n"
+    "  AudioContext.prototype.createConstantSource = function(){ return new ConstantSourceNode(this); };\n"
+    "  AudioContext.prototype.createAnalyser = function(){ return new AnalyserNode(this); };\n"
+    "  AudioContext.prototype.createDelay = function(m){ return new DelayNode(this); };\n"
+    "  AudioContext.prototype.createConvolver = function(){ return new ConvolverNode(this); };\n"
+    "  AudioContext.prototype.createChannelMerger = function(){ return new AudioNode(this); };\n"
+    "  AudioContext.prototype.createChannelSplitter = function(){ return new AudioNode(this); };\n"
+    "  AudioContext.prototype.createDynamicsCompressor = function(){ return new DynamicsCompressorNode(this); };\n"
+    "  AudioContext.prototype.createWaveShaper = function(){ return new WaveShaperNode(this); };\n"
+    "  AudioContext.prototype.createPanner = function(){ return new PannerNode(this); };\n"
+    "  AudioContext.prototype.createStereoPanner = function(){ return new StereoPannerNode(this); };\n"
+    "  AudioContext.prototype.createMediaElementSource = function(){ return new AudioNode(this); };\n"
+    "  AudioContext.prototype.createMediaStreamSource = function(){ return new AudioNode(this); };\n"
+    "  AudioContext.prototype.createMediaStreamDestination = function(){ return new AudioNode(this); };\n"
+    "  AudioContext.prototype.baseLatency = 0.01;\n"
+    "  AudioContext.prototype.outputLatency = 0.02;\n"
+    "  Object.assign(AudioContext.prototype, _eventTargetMixin);\n"
+    "  function OfflineAudioContext(c, l, s){\n"
+    "    this.sampleRate = s || 44100;\n"
+    "    this.length = l || 44100;\n"
+    "    this.currentTime = 0;\n"
+    "    this.state = 'running';\n"
+    "    this.destination = new AudioDestinationNode(this);\n"
+    "    this.listener = new AudioListener();\n"
+    "    this._activeSources = [];\n"
+    "  }\n"
+    "  OfflineAudioContext.prototype = Object.create(AudioContext.prototype);\n"
+    "  OfflineAudioContext.prototype.startRendering = function(){\n"
+    "    var ab = new AudioBuffer(2, this.length, this.sampleRate);\n"
+    "    return Promise.resolve(ab);\n"
+    "  };\n"
+    "  window.OfflineAudioContext = OfflineAudioContext;\n"
+    "  window.webkitOfflineAudioContext = OfflineAudioContext;\n"
+    "  window.BaseAudioContext = AudioContext;\n"
+    "  window.AudioNode = AudioNode;\n"
+    "  window.AudioBuffer = AudioBuffer;\n"
+    "  window.AudioParam = AudioParam;\n"
+    "  window.GainNode = GainNode;\n"
+    "  window.OscillatorNode = OscillatorNode;\n"
+    "  window.BiquadFilterNode = PlayableBiquadFilterNode = BiquadFilterNode;\n"
+    "  window.AudioBufferSourceNode = AudioBufferSourceNode;\n"
+    "  window.AudioDestinationNode = AudioDestinationNode;\n"
+    "  window.AudioListener = AudioListener;\n"
+    "  window.ConstantSourceNode = ConstantSourceNode;\n"
+    "  window.AnalyserNode = AnalyserNode;\n"
+    "  window.DelayNode = DelayNode;\n"
+    "  window.ConvolverNode = ConvolverNode;\n"
+    "  window.DynamicsCompressorNode = DynamicsCompressorNode;\n"
+    "  window.WaveShaperNode = WaveShaperNode;\n"
+    "  window.StereoPannerNode = StereoPannerNode;\n"
+    "  window.PannerNode = PannerNode;\n"
     "  AudioContext.prototype._tick = function(){\n"
     "    if(this.state !== 'running') return;\n"
-    "    var chunkSize = Math.floor(this.sampleRate * 0.03);\n"
-    "    var now = this.currentTime; var dt = 1.0 / this.sampleRate;\n"
-    "    var out = new Float32Array(chunkSize); var active = false;\n"
-    "    function getGain(node, t){\n"
-    "      var g = 1.0;\n"
+    "    var nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();\n"
+    "    var elapsed = (nowMs - (this._lastTickMs || nowMs)) / 1000.0;\n"
+    "    this._lastTickMs = nowMs;\n"
+    "    if(elapsed < 0.004) elapsed = 0.016;\n"
+    "    if(elapsed > 0.12) elapsed = 0.12;\n"
+    "    if(!this._wasActive && this._activeSources.length > 0 && elapsed < 0.045) elapsed = 0.045;\n"
+    "    var sr = this.sampleRate || 44100;\n"
+    "    var chunkSize = Math.floor(sr * elapsed);\n"
+    "    if(chunkSize < 512) chunkSize = 512;\n"
+    "    var now = this.currentTime; var dt = 1.0 / sr;\n"
+    "    var out = (this._outBuf && this._outBuf.length >= chunkSize) ? this._outBuf : (this._outBuf = new Float32Array(Math.max(chunkSize, 4096)));\n"
+    "    out.fill(0, 0, chunkSize);\n"
+    "    var blk = this._blkBuf || (this._blkBuf = new Float32Array(64));\n"
+    "    var active = false;\n"
+    "    function reachesDest(node, depth){\n"
+    "      if(!node || !node._connections || (depth||0) > 10) return false;\n"
     "      for(var i=0; i<node._connections.length; i++){\n"
     "        var c = node._connections[i];\n"
-    "        if(c instanceof GainNode) g *= c.gain._valAt(t) * getGain(c, t);\n"
+    "        if(c instanceof AudioDestinationNode) return true;\n"
+    "        if(reachesDest(c, (depth||0)+1)) return true;\n"
     "      }\n"
-    "      return g;\n"
+    "      return false;\n"
+    "    }\n"
+    "    function routeChain(node, val, t, depth){\n"
+    "      if(!node || !node._connections || (depth||0) > 10 || val === 0.0) return 0.0;\n"
+    "      var sum = 0.0;\n"
+    "      for(var i=0; i<node._connections.length; i++){\n"
+    "        var c = node._connections[i];\n"
+    "        if(c instanceof AudioDestinationNode){ sum += val; }\n"
+    "        else if(c instanceof GainNode){ sum += routeChain(c, val * c.gain._valAt(t), t, (depth||0)+1); }\n"
+    "        else if(c instanceof BiquadFilterNode){ sum += routeChain(c, c._process(val, t, sr), t, (depth||0)+1); }\n"
+    "        else if(c instanceof AudioNode){ sum += routeChain(c, val, t, (depth||0)+1); }\n"
+    "      }\n"
+    "      return sum;\n"
+    "    }\n"
+    "    function finishSrc(src){\n"
+    "      if(!src._ended){\n"
+    "        src._ended = true;\n"
+    "        if(typeof src.onended === 'function'){ try{ src.onended({type:'ended', target:src}); }catch(_){} }\n"
+    "        if(typeof src.dispatchEvent === 'function'){ try{ src.dispatchEvent({type:'ended', target:src}); }catch(_){} }\n"
+    "      }\n"
+    "    }\n"
+    "    var TWO_PI = 2.0 * Math.PI;\n"
+    "    var BLOCK = 64;\n"
+    "    function oscTypeId(t){ return t==='square'?1:(t==='sawtooth'?2:(t==='triangle'?3:0)); }\n"
+    "    function fltTypeId(t){ return t==='lowpass'?0:(t==='highpass'?1:(t==='bandpass'?2:(t==='notch'?3:(t==='allpass'?4:-1)))); }\n"
+    "    function routeBlock(srcUid, node, buf, n, t0, t1, bStart, gainMul0, gainMul1, depth){\n"
+    "      if(!node || !node._connections || (depth||0) > 10) return;\n"
+    "      if(Math.abs(gainMul0) < 1e-6 && Math.abs(gainMul1) < 1e-6) return;\n"
+    "      for(var i=0; i<node._connections.length; i++){\n"
+    "        var c = node._connections[i];\n"
+    "        if(c instanceof AudioDestinationNode){\n"
+    "          __mini_audio_mix_block(out, bStart, buf, n, gainMul0, gainMul1);\n"
+    "          active = true;\n"
+    "        } else if(c instanceof GainNode){\n"
+    "          var g0 = c.gain._valAt(t0), g1 = c.gain._valAt(t1);\n"
+    "          routeBlock(srcUid, c, buf, n, t0, t1, bStart, gainMul0 * g0, gainMul1 * g1, (depth||0)+1);\n"
+    "        } else if(c instanceof BiquadFilterNode){\n"
+    "          var ft = fltTypeId(c.type);\n"
+    "          if(ft >= 0){\n"
+    "            var f0 = Math.min(sr * 0.45, Math.max(10, c.frequency._valAt(t0) * Math.pow(2, c.detune._valAt(t0)/1200.0)));\n"
+    "            var q = Math.max(0.01, c.Q._valAt(t0));\n"
+    "            var bst = c._bstates[srcUid] || (c._bstates[srcUid] = new Float32Array(4));\n"
+    "            __mini_audio_biquad_block(buf, n, sr, ft, f0, q, bst);\n"
+    "          }\n"
+    "          routeBlock(srcUid, c, buf, n, t0, t1, bStart, gainMul0, gainMul1, (depth||0)+1);\n"
+    "        } else if(c instanceof AudioNode){\n"
+    "          routeBlock(srcUid, c, buf, n, t0, t1, bStart, gainMul0, gainMul1, (depth||0)+1);\n"
+    "        }\n"
+    "      }\n"
     "    }\n"
     "    for(var sIdx = this._activeSources.length-1; sIdx >= 0; sIdx--){\n"
     "      var src = this._activeSources[sIdx];\n"
-    "      if(src.startTime < 0 || now < src.startTime) continue;\n"
-    "      if(src.stopTime >= 0 && now >= src.stopTime){ this._activeSources.splice(sIdx, 1); continue; }\n"
-    "      active = true;\n"
+    "      if(src.startTime < 0) continue;\n"
+    "      if(src.stopTime >= 0 && now >= src.stopTime){ finishSrc(src); this._activeSources.splice(sIdx, 1); continue; }\n"
+    "      if(now + chunkSize * dt < src.startTime) continue;\n"
+    "      if(!reachesDest(src, 0)) continue;\n"
     "      if(src instanceof OscillatorNode){\n"
-    "        for(var i=0; i<chunkSize; i++){\n"
-    "          var t = now + i * dt;\n"
-    "          if(src.stopTime >= 0 && t >= src.stopTime) break;\n"
-    "          var freq = src.frequency._valAt(t);\n"
-    "          src._phase += 2.0 * Math.PI * freq * dt;\n"
-    "          var val = Math.sin(src._phase);\n"
-    "          if(src.type==='square') val = Math.sin(src._phase) >= 0 ? 1 : -1;\n"
-    "          else if(src.type==='sawtooth') val = 2.0 * (src._phase/(2*Math.PI) - Math.floor(src._phase/(2*Math.PI) + 0.5));\n"
-    "          else if(src.type==='triangle') val = 2.0 * Math.abs(2.0*(src._phase/(2*Math.PI) - Math.floor(src._phase/(2*Math.PI)+0.5))) - 1.0;\n"
-    "          out[i] += val * getGain(src, t);\n"
+    "        var ot = oscTypeId(src.type);\n"
+    "        for(var bStart = 0; bStart < chunkSize; bStart += BLOCK){\n"
+    "          var n = Math.min(BLOCK, chunkSize - bStart);\n"
+    "          var t0 = now + bStart * dt;\n"
+    "          var t1 = now + (bStart + n) * dt;\n"
+    "          if(t1 <= src.startTime) continue;\n"
+    "          if(src.stopTime >= 0 && t0 >= src.stopTime){ finishSrc(src); break; }\n"
+    "          var freq0 = src.frequency._valAt(t0) * Math.pow(2.0, src.detune._valAt(t0) / 1200.0);\n"
+    "          var freq1 = src.frequency._valAt(t1) * Math.pow(2.0, src.detune._valAt(t1) / 1200.0);\n"
+    "          if(freq0 < 20.0) freq0 = 20.0; else if(freq0 > sr * 0.45) freq0 = sr * 0.45;\n"
+    "          if(freq1 < 20.0) freq1 = 20.0; else if(freq1 > sr * 0.45) freq1 = sr * 0.45;\n"
+    "          var age0 = Math.max(0.0, t0 - src.startTime), age1 = Math.max(0.0, t1 - src.startTime);\n"
+    "          var env0 = (age0 < 0.002) ? (age0 / 0.002) : 1.0;\n"
+    "          var env1 = (age1 < 0.002) ? (age1 / 0.002) : 1.0;\n"
+    "          if(src.stopTime >= 0){\n"
+    "            if(src.stopTime - t0 < 0.002) env0 *= Math.max(0.0, (src.stopTime - t0) / 0.002);\n"
+    "            if(src.stopTime - t1 < 0.002) env1 *= Math.max(0.0, (src.stopTime - t1) / 0.002);\n"
+    "          }\n"
+    "          src._phase = __mini_audio_osc_block(blk, n, sr, ot, src._phase, freq0, freq1, env0 * 0.22, env1 * 0.22);\n"
+    "          routeBlock(src._uid || 0, src, blk, n, t0, t1, bStart, 1.0, 1.0, 0);\n"
+    "          if(src.stopTime >= 0 && t1 >= src.stopTime){ finishSrc(src); break; }\n"
     "        }\n"
     "      } else if(src instanceof AudioBufferSourceNode && src.buffer){\n"
     "        var data = src.buffer.getChannelData(0);\n"
+    "        var bufSr = src.buffer.sampleRate || sr;\n"
+    "        var srRatio = bufSr / sr;\n"
+    "        var lStart = (src.loopStart || 0) * bufSr;\n"
+    "        var lEnd = (src.loopEnd > 0) ? Math.min(data.length, src.loopEnd * bufSr) : data.length;\n"
     "        for(var i=0; i<chunkSize; i++){\n"
     "          var t = now + i * dt;\n"
-    "          if(src.stopTime >= 0 && t >= src.stopTime) break;\n"
-    "          var sPos = Math.floor(src._offset);\n"
-    "          if(sPos < data.length){\n"
-    "            out[i] += data[sPos] * getGain(src, t);\n"
-    "            src._offset += src.playbackRate._valAt(t);\n"
+    "          if(t < src.startTime) continue;\n"
+    "          if(src.stopTime >= 0 && t >= src.stopTime){ finishSrc(src); break; }\n"
+    "          var s0 = Math.floor(src._offset);\n"
+    "          if(s0 < data.length){\n"
+    "            var frac = src._offset - s0;\n"
+    "            var s1 = (s0 + 1 < data.length) ? s0 + 1 : s0;\n"
+    "            var sample = data[s0] + frac * (data[s1] - data[s0]);\n"
+    "            var env = 1.0;\n"
+    "            if(src.stopTime >= 0 && src.stopTime - t < 0.002) env = Math.max(0.0, (src.stopTime - t) / 0.002);\n"
+    "            var sVal = routeChain(src, sample * env * 0.35, t, 0);\n"
+    "            if(Math.abs(sVal) > 0.0001) active = true;\n"
+    "            out[i] += sVal;\n"
+    "            var rate = src.playbackRate._valAt(t) * Math.pow(2.0, src.detune._valAt(t) / 1200.0);\n"
+    "            src._offset += rate * srRatio;\n"
+    "            if(src.loop && src._offset >= lEnd){ src._offset = lStart + (src._offset - lEnd); }\n"
     "          } else {\n"
-    "            if(src.loop) src._offset = src.loopStart || 0;\n"
-    "            else { src.stopTime = t; break; }\n"
+    "            if(src.loop){ src._offset = lStart; }\n"
+    "            else { src.stopTime = t; finishSrc(src); break; }\n"
     "          }\n"
     "        }\n"
     "      }\n"
     "    }\n"
     "    this.currentTime += chunkSize * dt;\n"
-    "    if(active && typeof __mini_audio_queue_pcm === 'function') __mini_audio_queue_pcm(out);\n"
+    "    if((active || this._wasActive) && typeof __mini_audio_queue_pcm === 'function'){\n"
+    "      __mini_audio_queue_pcm(out, chunkSize);\n"
+    "    }\n"
+    "    this._wasActive = active;\n"
     "  };\n"
     "  window.AudioContext = AudioContext;\n"
     "  window.webkitAudioContext = AudioContext;\n"
@@ -1735,6 +2524,7 @@ typedef struct MiniNodeWrapper
 {
     struct MiniBridge *bridge;
     JSValue val;
+    struct MiniNode *node;
 } MiniNodeWrapper;
 
 typedef struct MiniBridge
@@ -1799,6 +2589,7 @@ typedef struct MiniBridge
        the IPC registry to route messages between the main context and each
        renderer. Set via mini_bridge_set_window_id(). */
     int window_id;
+    int in_dispatch_resize;
 
     /* The MiniApp host (main process) for the main/primary bridge, so the
        BrowserWindow constructor (in the main context) can reach the host to
@@ -1843,15 +2634,12 @@ void mini_bridge_on_node_destroyed(struct MiniNode *n)
 {
     if (!n)
         return;
-    /* Recover the owning bridge from the node's JS wrapper. The wrapper is
-       created in wrap_node() with the bridge that owns the context, so this
-       is the correct context to free its JSValue/listeners with — independent
-       of which window is "active" right now (critical for multi-window, where
-       each window has its own JSRuntime and a JSValue must be freed by the
-       context that created it). */
-    MiniNodeWrapper *w = n->js_wrapper ? (MiniNodeWrapper *)n->js_wrapper : NULL;
-    MiniBridge *b = w ? w->bridge : g_active_js_bridge;
-    if (b)
+    MiniNodeWrapper *w = (MiniNodeWrapper *)n->js_wrapper;
+    n->js_wrapper = NULL;
+    if (!w)
+        return;
+    MiniBridge *b = w->bridge;
+    if (b && b->ctx)
     {
         for (int i = 0; i < b->ev_listeners_n; )
         {
@@ -1872,23 +2660,16 @@ void mini_bridge_on_node_destroyed(struct MiniNode *n)
                 i++;
             }
         }
-    }
-    if (w)
-    {
-        if (b && b->ctx)
-        {
-            JS_SetOpaque(w->val, NULL);
-            JS_FreeValue(b->ctx, w->val);
+        JS_SetOpaque(w->val, NULL);
+        JS_FreeValue(b->ctx, w->val);
 
-            for (int i = 0; i < b->all_wrappers_n; i++) {
-                if (b->all_wrappers[i] == w) {
-                    b->all_wrappers[i] = NULL;
-                }
+        for (int i = 0; i < b->all_wrappers_n; i++) {
+            if (b->all_wrappers[i] == w) {
+                b->all_wrappers[i] = NULL;
             }
         }
-        free(w);
-        n->js_wrapper = NULL;
     }
+    free(w);
 }
 
 /* Set/get the process-wide "active bridge" — the bridge whose JSContext is
@@ -2050,6 +2831,7 @@ static JSValue wrap_node(JSContext *ctx, struct MiniNode *n, JSClassID cid)
     {
         saved->bridge = b;                 /* owner context for later free   */
         saved->val = JS_DupValue(ctx, obj);
+        saved->node = n;
         n->js_wrapper = saved;
 
         if (b) {
@@ -2122,6 +2904,8 @@ static void maybe_execute_script(MiniBridge *b, struct MiniNode *child, JSValueC
         {
             mini_css_apply(b->doc, css);
             b->doc->dirty = 1;
+            b->doc->restyle_dirty = 1;
+            b->doc->layout_dirty = 1;
             b->doc->paint_dirty = 1;
         }
         return;
@@ -2292,6 +3076,39 @@ static JSValue js_appendChild(JSContext *ctx, JSValueConst tv, int argc, JSValue
     if (!parent || !child)
         return JS_ThrowTypeError(ctx, "appendChild: bad args");
     mini_node_append_child(parent, child);
+    if (b && b->doc)
+    {
+        b->doc->dirty = 1;
+        b->doc->restyle_dirty = 1;
+        b->doc->layout_dirty = 1;
+        b->doc->paint_dirty = 1;
+    }
+    if (parent->tag && !strcmp(parent->tag, "style") && b && b->doc)
+    {
+        const char *css = child->text;
+        if (css && css[0])
+        {
+            mini_css_apply(b->doc, css);
+            b->doc->dirty = 1;
+            b->doc->restyle_dirty = 1;
+            b->doc->layout_dirty = 1;
+            b->doc->paint_dirty = 1;
+            b->doc->needs_resize_event = 1;
+        }
+    }
+    if (child->tag && !strcmp(child->tag, "style") && b && b->doc)
+    {
+        const char *css = child->text ? child->text : (child->first_child ? child->first_child->text : NULL);
+        if (css && css[0])
+        {
+            mini_css_apply(b->doc, css);
+            b->doc->dirty = 1;
+            b->doc->restyle_dirty = 1;
+            b->doc->layout_dirty = 1;
+            b->doc->paint_dirty = 1;
+            b->doc->needs_resize_event = 1;
+        }
+    }
     maybe_execute_script(b, child, argv[0]);
     return JS_DupValue(ctx, argv[0]);
 }
@@ -2303,6 +3120,13 @@ static JSValue js_removeChild(JSContext *ctx, JSValueConst tv, int argc, JSValue
     if (!parent || !child)
         return JS_ThrowTypeError(ctx, "removeChild: bad args");
     mini_node_remove_child(parent, child);
+    if (b && b->doc)
+    {
+        b->doc->dirty = 1;
+        b->doc->restyle_dirty = 1;
+        b->doc->layout_dirty = 1;
+        b->doc->paint_dirty = 1;
+    }
     return JS_DupValue(ctx, argv[0]);
 }
 static JSValue js_setAttribute(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
@@ -2322,10 +3146,18 @@ static JSValue js_setAttribute(JSContext *ctx, JSValueConst tv, int argc, JSValu
     mini_node_set_attribute(n, k, v);
     if (!strcmp(k, "class") || !strcmp(k, "id"))
     {
-        if (b->doc) mini_dom_restyle(b->doc);
+        if (b->doc) {
+            b->doc->restyle_dirty = 1;
+            b->doc->layout_dirty = 1;
+            b->doc->paint_dirty = 1;
+        }
     }
     if (!strcmp(k, "style"))
     {
+        if (b->doc) {
+            b->doc->layout_dirty = 1;
+            b->doc->paint_dirty = 1;
+        }
         /* inline CSS: "color:red;background:#000;font-size:14px" */
         char buf[256];
         strncpy(buf, v, sizeof(buf) - 1);
@@ -2350,6 +3182,28 @@ static JSValue js_setAttribute(JSContext *ctx, JSValueConst tv, int argc, JSValu
     JS_FreeCString(ctx, v);
     return JS_UNDEFINED;
 }
+int mini_node_get_attributes(const struct MiniNode *n, const char **names, const char **values, int max_attrs);
+
+static JSValue js_getAttributes(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    MiniBridge *b = bridge_of(ctx);
+    struct MiniNode *n = el_this(ctx, tv, b->el_cid);
+    if (!n)
+        return JS_NewArray(ctx);
+    const char *names[128];
+    const char *values[128];
+    int count = mini_node_get_attributes(n, names, values, 128);
+    JSValue arr = JS_NewArray(ctx);
+    for (int i = 0; i < count; i++)
+    {
+        JSValue item = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, item, "name", JS_NewString(ctx, names[i] ? names[i] : ""));
+        JS_SetPropertyStr(ctx, item, "value", JS_NewString(ctx, values[i] ? values[i] : ""));
+        JS_SetPropertyUint32(ctx, arr, i, item);
+    }
+    return arr;
+}
+
 static JSValue js_getAttribute(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
@@ -2392,6 +3246,7 @@ static JSValue js_setStyle(JSContext *ctx, JSValueConst tv, int argc, JSValueCon
         if (b->doc)
         {
             b->doc->dirty = 1;
+            b->doc->layout_dirty = 1;
             b->doc->paint_dirty = 1;
         }
     }
@@ -2518,6 +3373,21 @@ static JSValue js_getBoundingClientRect(JSContext *ctx, JSValueConst tv, int arg
     float x = 0, y = 0, w = 0, h = 0;
     if (n)
     {
+        if (b && b->doc && (b->doc->layout_dirty || b->doc->restyle_dirty))
+        {
+            if (b->doc->restyle_dirty)
+            {
+                mini_dom_restyle(b->doc);
+                b->doc->restyle_dirty = 0;
+            }
+            if (b->doc->layout_dirty)
+            {
+                int cvw = b->doc->viewport_w > 0 ? b->doc->viewport_w : 1280;
+                int cvh = b->doc->viewport_h > 0 ? b->doc->viewport_h : 720;
+                mini_layout_run(b->doc, cvw, cvh);
+                b->doc->layout_dirty = 0;
+            }
+        }
         x = n->style.abs_x + n->style.translate_x;
         y = n->style.abs_y + n->style.translate_y;
         w = n->style.w;
@@ -2546,6 +3416,17 @@ static JSValue js_getClientRects(JSContext *ctx, JSValueConst tv, int argc, JSVa
     JS_SetPropertyUint32(ctx, arr, 0, rect);
     return arr;
 }
+static size_t measure_text_len(const struct MiniNode *n)
+{
+    if (!n)
+        return 0;
+    if (n->type == MN_TEXT_NODE && n->text)
+        return strlen(n->text);
+    size_t total = 0;
+    for (struct MiniNode *c = n->first_child; c; c = c->next_sibling)
+        total += measure_text_len(c);
+    return total;
+}
 /* W3C textContent: concatenate all descendant text-node data */
 static void concat_text(const struct MiniNode *n, char *buf, size_t cap, size_t *o)
 {
@@ -2567,12 +3448,18 @@ static JSValue js_getText(JSContext *ctx, JSValueConst tv, int argc, JSValueCons
 {
     MiniBridge *b = bridge_of(ctx);
     struct MiniNode *n = el_this(ctx, tv, b->el_cid);
-    char buf[4096];
+    if (!n)
+        return JS_NewString(ctx, "");
+    size_t total = measure_text_len(n);
+    char *buf = (char *)malloc(total + 1);
+    if (!buf)
+        return JS_NewString(ctx, "");
     size_t o = 0;
-    if (n)
-        concat_text(n, buf, sizeof buf, &o);
+    concat_text(n, buf, total + 1, &o);
     buf[o] = 0;
-    return JS_NewStringLen(ctx, buf, o);
+    JSValue ret = JS_NewStringLen(ctx, buf, o);
+    free(buf);
+    return ret;
 }
 static JSValue js_setText(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
@@ -2585,11 +3472,20 @@ static JSValue js_setText(JSContext *ctx, JSValueConst tv, int argc, JSValueCons
         while (n->first_child)
             mini_node_remove_child(n, n->first_child);
         mini_node_append_child(n, mini_node_create_text(t ? t : ""));
+        if (b && b->doc)
+        {
+            b->doc->dirty = 1;
+            b->doc->layout_dirty = 1;
+            b->doc->paint_dirty = 1;
+        }
         if (n->tag && !strcmp(n->tag, "style") && t && b && b->doc)
         {
             mini_css_apply(b->doc, t);
             b->doc->dirty = 1;
+            b->doc->restyle_dirty = 1;
+            b->doc->layout_dirty = 1;
             b->doc->paint_dirty = 1;
+            b->doc->needs_resize_event = 1;
         }
     }
     JS_FreeCString(ctx, t);
@@ -3070,6 +3966,106 @@ static JSValue js_blur(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *
     return JS_UNDEFINED;
 }
 
+static int node_value_len(struct MiniNode *n)
+{
+    if (!n || !n->tag) return 0;
+    const char *v = NULL;
+    if (!strcasecmp(n->tag, "textarea"))
+        v = (n->first_child && n->first_child->type == MN_TEXT_NODE) ? n->first_child->text : n->text;
+    else
+        v = mini_node_get_attribute(n, "value");
+    return v ? (int)strlen(v) : 0;
+}
+
+static JSValue js_getSelStart(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    MiniBridge *b = bridge_of(ctx);
+    struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
+    if (!n) return JS_NewInt32(ctx, 0);
+    int len = node_value_len(n);
+    int caret = n->caret_offset < 0 ? 0 : (n->caret_offset > len ? len : n->caret_offset);
+    int anchor = n->sel_anchor_off;
+    if (anchor >= 0) {
+        if (anchor > len) anchor = len;
+        return JS_NewInt32(ctx, anchor < caret ? anchor : caret);
+    }
+    return JS_NewInt32(ctx, caret);
+}
+
+static JSValue js_getSelEnd(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    MiniBridge *b = bridge_of(ctx);
+    struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
+    if (!n) return JS_NewInt32(ctx, 0);
+    int len = node_value_len(n);
+    int caret = n->caret_offset < 0 ? 0 : (n->caret_offset > len ? len : n->caret_offset);
+    int anchor = n->sel_anchor_off;
+    if (anchor >= 0) {
+        if (anchor > len) anchor = len;
+        return JS_NewInt32(ctx, anchor > caret ? anchor : caret);
+    }
+    return JS_NewInt32(ctx, caret);
+}
+
+static JSValue js_setSelStart(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    MiniBridge *b = bridge_of(ctx);
+    struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
+    if (!n || argc < 1) return JS_UNDEFINED;
+    int32_t s = 0;
+    JS_ToInt32(ctx, &s, argv[0]);
+    int len = node_value_len(n);
+    if (s < 0) s = 0;
+    if (s > len) s = len;
+    int cur_end = (n->sel_anchor_off >= 0 && n->sel_anchor_off > n->caret_offset) ? n->sel_anchor_off : n->caret_offset;
+    if (cur_end < s) cur_end = s;
+    if (cur_end > len) cur_end = len;
+    n->sel_anchor_off = (s == cur_end) ? -1 : s;
+    n->caret_offset = cur_end;
+    if (b && b->doc) b->doc->paint_dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_setSelEnd(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    MiniBridge *b = bridge_of(ctx);
+    struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
+    if (!n || argc < 1) return JS_UNDEFINED;
+    int32_t e = 0;
+    JS_ToInt32(ctx, &e, argv[0]);
+    int len = node_value_len(n);
+    if (e < 0) e = 0;
+    if (e > len) e = len;
+    int cur_start = (n->sel_anchor_off >= 0 && n->sel_anchor_off < n->caret_offset) ? n->sel_anchor_off : n->caret_offset;
+    if (cur_start < 0) cur_start = 0;
+    if (cur_start > e) cur_start = e;
+    n->sel_anchor_off = (cur_start == e) ? -1 : cur_start;
+    n->caret_offset = e;
+    if (b && b->doc) b->doc->paint_dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_setSelectionRange(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    MiniBridge *b = bridge_of(ctx);
+    struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
+    if (!n || argc < 2) return JS_UNDEFINED;
+    int32_t a = 0, c = 0;
+    JS_ToInt32(ctx, &a, argv[0]);
+    JS_ToInt32(ctx, &c, argv[1]);
+    int len = node_value_len(n);
+    if (a < 0) a = 0;
+    if (a > len) a = len;
+    if (c < 0) c = 0;
+    if (c > len) c = len;
+    n->sel_anchor_off = (a == c) ? -1 : a;
+    n->caret_offset = c;
+    if (b && b->doc) b->doc->paint_dirty = 1;
+    return JS_UNDEFINED;
+}
+
 /* innerHTML getter/setter (backed by mini_dom_outer_html / set_inner_html). */
 static JSValue js_getInnerHTML(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
@@ -3079,9 +4075,13 @@ static JSValue js_getInnerHTML(JSContext *ctx, JSValueConst tv, int argc, JSValu
     struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
     if (!n)
         return JS_NewString(ctx, "");
-    char buf[32768];
-    mini_dom_outer_html(n, 1, buf, sizeof buf);
-    return JS_NewString(ctx, buf);
+    size_t out_len = 0;
+    char *buf = mini_dom_outer_html_alloc(n, 1, &out_len);
+    if (!buf)
+        return JS_NewString(ctx, "");
+    JSValue ret = JS_NewStringLen(ctx, buf, out_len);
+    free(buf);
+    return ret;
 }
 static JSValue js_setInnerHTML(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
@@ -3093,11 +4093,21 @@ static JSValue js_setInnerHTML(JSContext *ctx, JSValueConst tv, int argc, JSValu
         if (html)
         {
             mini_node_set_inner_html(n, html);
+            if (b && b->doc)
+            {
+                b->doc->dirty = 1;
+                b->doc->restyle_dirty = 1;
+                b->doc->layout_dirty = 1;
+                b->doc->paint_dirty = 1;
+            }
             if (n->tag && !strcmp(n->tag, "style") && b && b->doc)
             {
                 mini_css_apply(b->doc, html);
                 b->doc->dirty = 1;
+                b->doc->restyle_dirty = 1;
+                b->doc->layout_dirty = 1;
                 b->doc->paint_dirty = 1;
+                b->doc->needs_resize_event = 1;
             }
         }
         JS_FreeCString(ctx, html);
@@ -3132,6 +4142,26 @@ static JSValue js_insertBefore(JSContext *ctx, JSValueConst tv, int argc, JSValu
     if (parent && newc)
     {
         mini_node_insert_before(parent, newc, ref);
+        if (b && b->doc)
+        {
+            b->doc->dirty = 1;
+            b->doc->restyle_dirty = 1;
+            b->doc->layout_dirty = 1;
+            b->doc->paint_dirty = 1;
+        }
+        if (newc->tag && !strcmp(newc->tag, "style") && b && b->doc)
+        {
+            const char *css = newc->text ? newc->text : (newc->first_child ? newc->first_child->text : NULL);
+            if (css && css[0])
+            {
+                mini_css_apply(b->doc, css);
+                b->doc->dirty = 1;
+                b->doc->restyle_dirty = 1;
+                b->doc->layout_dirty = 1;
+                b->doc->paint_dirty = 1;
+                b->doc->needs_resize_event = 1;
+            }
+        }
         maybe_execute_script(b, newc, argv[0]);
     }
     return newc ? JS_DupValue(ctx, argv[0]) : JS_NULL;
@@ -3364,6 +4394,15 @@ static JSValue js_setNodeValue(JSContext *ctx, JSValueConst tv, int argc, JSValu
     {
         const char *t = JS_ToCString(ctx, argv[0]);
         mini_node_set_text(n, t ? t : "");
+        if (n->parent && n->parent->tag && !strcmp(n->parent->tag, "style") && b && b->doc)
+        {
+            if (t && t[0])
+            {
+                mini_css_apply(b->doc, t);
+                b->doc->dirty = 1;
+                b->doc->paint_dirty = 1;
+            }
+        }
         if (t)
             JS_FreeCString(ctx, t);
         if (b->doc)
@@ -3455,24 +4494,45 @@ static JSValue js_click(JSContext *ctx, JSValueConst tv, int argc, JSValueConst 
 /* element.scrollIntoView() — best-effort: scroll the document so the box is on screen. */
 static JSValue js_scrollIntoView(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
-    (void)argc;
-    (void)argv;
     MiniBridge *b = bridge_of(ctx);
     struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
     if (!b->doc || !n)
         return JS_UNDEFINED;
-    float y = n->style.abs_y, h = n->style.h > 0 ? n->style.h : 0;
-    float vh = (float)b->doc->viewport_h;
-    if (vh <= 0)
-        vh = (float)b->r->gpu.height;
-    if (y < b->doc->scroll_y)
-        b->doc->scroll_y = y;
-    else if (y + h > b->doc->scroll_y + vh)
-        b->doc->scroll_y = (y + h - vh > 0) ? (y + h - vh) : 0;
-    if (b->doc->scroll_y < 0)
-        b->doc->scroll_y = 0;
-    if (b->doc->scroll_y > b->doc->max_scroll_y)
-        b->doc->scroll_y = b->doc->max_scroll_y;
+    int smooth = 0;
+    if (argc >= 1 && JS_IsObject(argv[0]))
+    {
+        JSValue beh = JS_GetPropertyStr(ctx, argv[0], "behavior");
+        if (JS_IsString(beh))
+        {
+            const char *bs = JS_ToCString(ctx, beh);
+            if (bs)
+            {
+                if (!strcmp(bs, "smooth")) smooth = 1;
+                else if (!strcmp(bs, "instant") || !strcmp(bs, "auto")) smooth = 0;
+                JS_FreeCString(ctx, bs);
+            }
+        }
+        JS_FreeValue(ctx, beh);
+    }
+    float target_y = n->style.abs_y + b->doc->scroll_y;
+    if (target_y < 0.0f)
+        target_y = 0.0f;
+    if (b->doc->max_scroll_y > 0.0f && target_y > b->doc->max_scroll_y)
+        target_y = b->doc->max_scroll_y;
+    if (smooth)
+    {
+        b->doc->scroll_target_y = target_y;
+        b->doc->is_smooth_scrolling = 1;
+        b->doc->active_effects = 1;
+    }
+    else
+    {
+        b->doc->scroll_y = target_y;
+        b->doc->scroll_target_y = target_y;
+        b->doc->is_smooth_scrolling = 0;
+    }
+    b->doc->layout_dirty = 1;
+    b->doc->paint_dirty = 1;
     b->doc->dirty = 1;
     return JS_UNDEFINED;
 }
@@ -3498,9 +4558,13 @@ static JSValue js_getOuterHTML(JSContext *ctx, JSValueConst tv, int argc, JSValu
     struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(tv, b->el_cid);
     if (!n)
         return JS_NewString(ctx, "");
-    char buf[32768];
-    mini_dom_outer_html(n, 0, buf, sizeof buf);
-    return JS_NewString(ctx, buf);
+    size_t out_len = 0;
+    char *buf = mini_dom_outer_html_alloc(n, 0, &out_len);
+    if (!buf)
+        return JS_NewString(ctx, "");
+    JSValue ret = JS_NewStringLen(ctx, buf, out_len);
+    free(buf);
+    return ret;
 }
 /* outerHTML setter: best-effort replace this node in its parent with the
    parsed fragment. Falls back to innerHTML semantics when there's no parent. */
@@ -3539,7 +4603,12 @@ static JSValue js_setOuterHTML(JSContext *ctx, JSValueConst tv, int argc, JSValu
     }
     JS_FreeCString(ctx, html);
     if (b->doc)
+    {
         b->doc->dirty = 1;
+        b->doc->restyle_dirty = 1;
+        b->doc->layout_dirty = 1;
+        b->doc->paint_dirty = 1;
+    }
     return JS_UNDEFINED;
 }
 /* document.elementFromPoint(x, y) — hit test the laid-out tree. */
@@ -3580,6 +4649,13 @@ static JSValue js_createComment(JSContext *ctx, JSValueConst tv, int argc, JSVal
    gl.createBuffer / gl.drawArrays on it and they resolve via the proto. */
 static JSValue js_getContext(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
+    if (JS_IsObject(tv))
+    {
+        JSValue existing = JS_GetPropertyStr(ctx, tv, "_ctx");
+        if (JS_IsObject(existing))
+            return existing;
+        JS_FreeValue(ctx, existing);
+    }
     const char *kind = JS_ToCString(ctx, argv[0]);
     JSValue ret = JS_NULL;
     if (kind)
@@ -3613,6 +4689,8 @@ static JSValue js_getContext(JSContext *ctx, JSValueConst tv, int argc, JSValueC
            window rect and scissor draws to it. */
         JS_SetPropertyStr(ctx, ret, "_cv", JS_DupValue(ctx, tv));
         JS_SetPropertyStr(ctx, ret, "canvas", JS_DupValue(ctx, tv));
+        if (JS_IsObject(tv))
+            JS_SetPropertyStr(ctx, tv, "_ctx", JS_DupValue(ctx, ret));
         /* 2D context defaults */
         JS_SetPropertyStr(ctx, ret, "fillStyle", JS_NewString(ctx, "#000000"));
         JS_SetPropertyStr(ctx, ret, "strokeStyle", JS_NewString(ctx, "#000000"));
@@ -3722,21 +4800,52 @@ static JSValue js_byTag(JSContext *ctx, JSValueConst tv, int argc, JSValueConst 
 static JSValue js_doc_query(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
+    if (!b || !b->doc || argc <= 0)
+        return JS_NULL;
     const char *sel = JS_ToCString(ctx, argv[0]);
-    struct MiniNode *m = sel ? mini_dom_query_selector(b->doc, sel) : NULL;
+    struct MiniNode *target = el_this(ctx, tv, b->el_cid);
+    struct MiniNode *m = NULL;
+    if (sel)
+    {
+        if (target)
+        {
+            struct MiniNode *out[1];
+            if (mini_dom_node_query_selector_all(target, sel, out, 1) > 0)
+                m = out[0];
+        }
+        else
+        {
+            m = mini_dom_query_selector(b->doc, sel);
+        }
+    }
     JS_FreeCString(ctx, sel);
     return m ? wrap_node(ctx, m, b->el_cid) : JS_NULL;
 }
 static JSValue js_doc_queryAll(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
+    if (!b || !b->doc || argc <= 0)
+        return JS_NewArray(ctx);
     const char *sel = JS_ToCString(ctx, argv[0]);
-    struct MiniNode *out[256];
-    int c = sel ? mini_dom_query_selector_all(b->doc, sel, out, 256) : 0;
+    if (!sel)
+        return JS_NewArray(ctx);
+    int max = 16384;
+    struct MiniNode **out = (struct MiniNode **)malloc(max * sizeof(struct MiniNode *));
+    int c = 0;
+    if (out)
+    {
+        struct MiniNode *target = el_this(ctx, tv, b->el_cid);
+        if (target)
+            c = mini_dom_node_query_selector_all(target, sel, out, max);
+        else
+            c = mini_dom_query_selector_all(b->doc, sel, out, max);
+    }
     JS_FreeCString(ctx, sel);
     JSValue arr = JS_NewArray(ctx);
     for (int i = 0; i < c; i++)
         JS_SetPropertyUint32(ctx, arr, i, wrap_node(ctx, out[i], b->el_cid));
+    if (out)
+        free(out);
     return arr;
 }
 static JSValue js_document_body(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
@@ -3820,11 +4929,26 @@ static int ctx2d_is_onscreen(JSContext *ctx, JSValueConst tv)
     return onscreen;
 }
 
+static uint8_t *ctx2d_get_canvas_buffer(JSContext *ctx, JSValueConst tv, int *out_w, int *out_h);
+
+#define OFF2D_MAX_PTS 2048
+static struct {
+    float x[OFF2D_MAX_PTS];
+    float y[OFF2D_MAX_PTS];
+    int n;
+    int sub_start;
+    int is_circle;
+    float cx, cy, cr, ca0, ca1;
+} g_off2d_path;
+
 static JSValue js_ctx2d_beginPath(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     (void)ctx;
     (void)argc;
     (void)argv;
+    g_off2d_path.n = 0;
+    g_off2d_path.sub_start = 0;
+    g_off2d_path.is_circle = 0;
     if (ctx2d_is_onscreen(ctx, tv))
         mini_2d_begin_path();
     return JS_UNDEFINED;
@@ -3834,6 +4958,12 @@ static JSValue js_ctx2d_closePath(JSContext *ctx, JSValueConst tv, int argc, JSV
     (void)ctx;
     (void)argc;
     (void)argv;
+    if (g_off2d_path.n > g_off2d_path.sub_start && g_off2d_path.n < OFF2D_MAX_PTS)
+    {
+        g_off2d_path.x[g_off2d_path.n] = g_off2d_path.x[g_off2d_path.sub_start];
+        g_off2d_path.y[g_off2d_path.n] = g_off2d_path.y[g_off2d_path.sub_start];
+        g_off2d_path.n++;
+    }
     if (ctx2d_is_onscreen(ctx, tv))
         mini_2d_close_path();
     return JS_UNDEFINED;
@@ -3841,9 +4971,17 @@ static JSValue js_ctx2d_closePath(JSContext *ctx, JSValueConst tv, int argc, JSV
 static JSValue js_ctx2d_moveTo(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     (void)argc;
-    double x, y;
+    double x = 0, y = 0;
     JS_ToFloat64(ctx, &x, argv[0]);
     JS_ToFloat64(ctx, &y, argv[1]);
+    g_off2d_path.is_circle = 0;
+    if (g_off2d_path.n < OFF2D_MAX_PTS)
+    {
+        g_off2d_path.sub_start = g_off2d_path.n;
+        g_off2d_path.x[g_off2d_path.n] = (float)x;
+        g_off2d_path.y[g_off2d_path.n] = (float)y;
+        g_off2d_path.n++;
+    }
     if (ctx2d_is_onscreen(ctx, tv))
         mini_2d_move_to((float)x, (float)y);
     return JS_UNDEFINED;
@@ -3851,16 +4989,23 @@ static JSValue js_ctx2d_moveTo(JSContext *ctx, JSValueConst tv, int argc, JSValu
 static JSValue js_ctx2d_lineTo(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     (void)argc;
-    double x, y;
+    double x = 0, y = 0;
     JS_ToFloat64(ctx, &x, argv[0]);
     JS_ToFloat64(ctx, &y, argv[1]);
+    g_off2d_path.is_circle = 0;
+    if (g_off2d_path.n < OFF2D_MAX_PTS)
+    {
+        g_off2d_path.x[g_off2d_path.n] = (float)x;
+        g_off2d_path.y[g_off2d_path.n] = (float)y;
+        g_off2d_path.n++;
+    }
     if (ctx2d_is_onscreen(ctx, tv))
         mini_2d_line_to((float)x, (float)y);
     return JS_UNDEFINED;
 }
 static JSValue js_ctx2d_arc(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
-    double cx, cy, r, a0, a1;
+    double cx = 0, cy = 0, r = 0, a0 = 0, a1 = 0;
     int ccw = 0;
     JS_ToFloat64(ctx, &cx, argv[0]);
     JS_ToFloat64(ctx, &cy, argv[1]);
@@ -3869,6 +5014,21 @@ static JSValue js_ctx2d_arc(JSContext *ctx, JSValueConst tv, int argc, JSValueCo
     JS_ToFloat64(ctx, &a1, argv[4]);
     if (argc > 5)
         JS_ToInt32(ctx, &ccw, argv[5]);
+    if (g_off2d_path.n == 0 && fabsf((float)(a1 - a0)) >= 6.20f)
+    {
+        g_off2d_path.is_circle = 1;
+        g_off2d_path.cx = (float)cx;
+        g_off2d_path.cy = (float)cy;
+        g_off2d_path.cr = (float)r;
+    }
+    int segs = 32;
+    for (int i = 0; i <= segs && g_off2d_path.n < OFF2D_MAX_PTS; i++)
+    {
+        float ang = (float)a0 + ((float)(a1 - a0) * (float)i) / (float)segs;
+        g_off2d_path.x[g_off2d_path.n] = (float)cx + cosf(ang) * (float)r;
+        g_off2d_path.y[g_off2d_path.n] = (float)cy + sinf(ang) * (float)r;
+        g_off2d_path.n++;
+    }
     if (ctx2d_is_onscreen(ctx, tv))
         mini_2d_arc((float)cx, (float)cy, (float)r, (float)a0, (float)a1, ccw);
     return JS_UNDEFINED;
@@ -3880,7 +5040,80 @@ static JSValue js_ctx2d_fill(JSContext *ctx, JSValueConst tv, int argc, JSValueC
     float r, g, b, a;
     ctx2d_paint(ctx, tv, "fillStyle", &r, &g, &b, &a);
     if (ctx2d_is_onscreen(ctx, tv))
+    {
         mini_2d_fill(r, g, b, a);
+    }
+    else
+    {
+        int cw = 0, ch = 0;
+        uint8_t *buf = ctx2d_get_canvas_buffer(ctx, tv, &cw, &ch);
+        if (buf && cw > 0 && ch > 0 && a > 0.0f)
+        {
+            uint8_t ur = (uint8_t)(r * 255.0f), ug = (uint8_t)(g * 255.0f), ub = (uint8_t)(b * 255.0f), ua = (uint8_t)(a * 255.0f);
+            if (g_off2d_path.is_circle)
+            {
+                float cx = g_off2d_path.cx, cy = g_off2d_path.cy, rad = g_off2d_path.cr;
+                int x0 = (int)(cx - rad - 1.0f); if (x0 < 0) x0 = 0;
+                int y0 = (int)(cy - rad - 1.0f); if (y0 < 0) y0 = 0;
+                int x1 = (int)(cx + rad + 2.0f); if (x1 > cw) x1 = cw;
+                int y1 = (int)(cy + rad + 2.0f); if (y1 > ch) y1 = ch;
+                float r2 = rad * rad;
+                for (int py = y0; py < y1; py++)
+                {
+                    for (int px = x0; px < x1; px++)
+                    {
+                        float dx = (float)px + 0.5f - cx, dy = (float)py + 0.5f - cy;
+                        if (dx * dx + dy * dy <= r2)
+                        {
+                            uint8_t *dst = buf + (py * cw + px) * 4;
+                            if (ua >= 254) { dst[0] = ur; dst[1] = ug; dst[2] = ub; dst[3] = 255; }
+                            else { dst[0] = (uint8_t)(dst[0] * (1.0f - a) + ur * a); dst[1] = (uint8_t)(dst[1] * (1.0f - a) + ug * a); dst[2] = (uint8_t)(dst[2] * (1.0f - a) + ub * a); dst[3] = 255; }
+                        }
+                    }
+                }
+            }
+            else if (g_off2d_path.n >= 3)
+            {
+                float min_y = g_off2d_path.y[0], max_y = g_off2d_path.y[0];
+                for (int i = 1; i < g_off2d_path.n; i++)
+                {
+                    if (g_off2d_path.y[i] < min_y) min_y = g_off2d_path.y[i];
+                    if (g_off2d_path.y[i] > max_y) max_y = g_off2d_path.y[i];
+                }
+                int y0 = (int)min_y; if (y0 < 0) y0 = 0;
+                int y1 = (int)ceilf(max_y); if (y1 > ch) y1 = ch;
+                for (int py = y0; py < y1; py++)
+                {
+                    float scan_y = (float)py + 0.5f;
+                    float nodes[256];
+                    int nn = 0;
+                    for (int i = 0, j = g_off2d_path.n - 1; i < g_off2d_path.n; j = i++)
+                    {
+                        float yi = g_off2d_path.y[i], yj = g_off2d_path.y[j];
+                        if ((yi < scan_y && yj >= scan_y) || (yj < scan_y && yi >= scan_y))
+                        {
+                            if (nn < 256)
+                                nodes[nn++] = g_off2d_path.x[i] + (scan_y - yi) / (yj - yi) * (g_off2d_path.x[j] - g_off2d_path.x[i]);
+                        }
+                    }
+                    for (int i = 0; i < nn - 1; i++)
+                        for (int k = i + 1; k < nn; k++)
+                            if (nodes[i] > nodes[k]) { float t = nodes[i]; nodes[i] = nodes[k]; nodes[k] = t; }
+                    for (int i = 0; i < nn - 1; i += 2)
+                    {
+                        int x0 = (int)nodes[i]; if (x0 < 0) x0 = 0;
+                        int x1 = (int)ceilf(nodes[i + 1]); if (x1 > cw) x1 = cw;
+                        for (int px = x0; px < x1; px++)
+                        {
+                            uint8_t *dst = buf + (py * cw + px) * 4;
+                            if (ua >= 254) { dst[0] = ur; dst[1] = ug; dst[2] = ub; dst[3] = 255; }
+                            else { dst[0] = (uint8_t)(dst[0] * (1.0f - a) + ur * a); dst[1] = (uint8_t)(dst[1] * (1.0f - a) + ug * a); dst[2] = (uint8_t)(dst[2] * (1.0f - a) + ub * a); dst[3] = 255; }
+                        }
+                    }
+                }
+            }
+        }
+    }
     return JS_UNDEFINED;
 }
 static JSValue js_ctx2d_stroke(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
@@ -3894,7 +5127,48 @@ static JSValue js_ctx2d_stroke(JSContext *ctx, JSValueConst tv, int argc, JSValu
     JS_ToFloat64(ctx, &lwv, lw);
     JS_FreeValue(ctx, lw);
     if (ctx2d_is_onscreen(ctx, tv))
+    {
         mini_2d_stroke(r, g, b, a, (float)lwv);
+    }
+    else
+    {
+        int cw = 0, ch = 0;
+        uint8_t *buf = ctx2d_get_canvas_buffer(ctx, tv, &cw, &ch);
+        if (buf && cw > 0 && ch > 0 && g_off2d_path.n >= 2 && a > 0.0f)
+        {
+            uint8_t ur = (uint8_t)(r * 255.0f), ug = (uint8_t)(g * 255.0f), ub = (uint8_t)(b * 255.0f);
+            float half_w = (float)lwv * 0.5f;
+            if (half_w < 0.5f) half_w = 0.5f;
+            float hw2 = half_w * half_w;
+            for (int i = 0; i < g_off2d_path.n - 1; i++)
+            {
+                float x0 = g_off2d_path.x[i], y0 = g_off2d_path.y[i];
+                float x1 = g_off2d_path.x[i + 1], y1 = g_off2d_path.y[i + 1];
+                int bx0 = (int)((x0 < x1 ? x0 : x1) - half_w - 1.0f); if (bx0 < 0) bx0 = 0;
+                int by0 = (int)((y0 < y1 ? y0 : y1) - half_w - 1.0f); if (by0 < 0) by0 = 0;
+                int bx1 = (int)((x0 > x1 ? x0 : x1) + half_w + 2.0f); if (bx1 > cw) bx1 = cw;
+                int by1 = (int)((y0 > y1 ? y0 : y1) + half_w + 2.0f); if (by1 > ch) by1 = ch;
+                float dx = x1 - x0, dy = y1 - y0;
+                float l2 = dx * dx + dy * dy;
+                for (int py = by0; py < by1; py++)
+                {
+                    for (int px = bx0; px < bx1; px++)
+                    {
+                        float t = l2 > 0.0001f ? (((float)px + 0.5f - x0) * dx + ((float)py + 0.5f - y0) * dy) / l2 : 0.0f;
+                        if (t < 0.0f) t = 0.0f;
+                        if (t > 1.0f) t = 1.0f;
+                        float nx = x0 + t * dx - ((float)px + 0.5f);
+                        float ny = y0 + t * dy - ((float)py + 0.5f);
+                        if (nx * nx + ny * ny <= hw2)
+                        {
+                            uint8_t *dst = buf + (py * cw + px) * 4;
+                            dst[0] = ur; dst[1] = ug; dst[2] = ub; dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+    }
     return JS_UNDEFINED;
 }
 static const void *js_typed_data(JSContext *ctx, JSValueConst v, size_t *out_len);
@@ -4425,8 +5699,14 @@ static JSValue js_ctx2d_quadraticCurveTo(JSContext *ctx, JSValueConst tv, int ar
     JS_ToFloat64(ctx, &cpy, argv[1]);
     JS_ToFloat64(ctx, &x, argv[2]);
     JS_ToFloat64(ctx, &y, argv[3]);
-    float sx, sy;
-    mini_2d_get_pen(&sx, &sy);
+    float sx = 0.0f, sy = 0.0f;
+    if (ctx2d_is_onscreen(ctx, tv))
+        mini_2d_get_pen(&sx, &sy);
+    else if (g_off2d_path.n > 0)
+    {
+        sx = g_off2d_path.x[g_off2d_path.n - 1];
+        sy = g_off2d_path.y[g_off2d_path.n - 1];
+    }
     for (int i = 1; i <= 16; i++)
     {
         float t = i / 16.0f, mt = 1.0f - t;
@@ -4434,6 +5714,12 @@ static JSValue js_ctx2d_quadraticCurveTo(JSContext *ctx, JSValueConst tv, int ar
         float by = mt * mt * sy + 2 * mt * t * (float)cpy + t * t * (float)y;
         if (ctx2d_is_onscreen(ctx, tv))
             mini_2d_line_to(bx, by);
+        else if (g_off2d_path.n < OFF2D_MAX_PTS)
+        {
+            g_off2d_path.x[g_off2d_path.n] = bx;
+            g_off2d_path.y[g_off2d_path.n] = by;
+            g_off2d_path.n++;
+        }
     }
     return JS_UNDEFINED;
 }
@@ -4448,8 +5734,14 @@ static JSValue js_ctx2d_bezierCurveTo(JSContext *ctx, JSValueConst tv, int argc,
     JS_ToFloat64(ctx, &y2, argv[3]);
     JS_ToFloat64(ctx, &x, argv[4]);
     JS_ToFloat64(ctx, &y, argv[5]);
-    float sx, sy;
-    mini_2d_get_pen(&sx, &sy);
+    float sx = 0.0f, sy = 0.0f;
+    if (ctx2d_is_onscreen(ctx, tv))
+        mini_2d_get_pen(&sx, &sy);
+    else if (g_off2d_path.n > 0)
+    {
+        sx = g_off2d_path.x[g_off2d_path.n - 1];
+        sy = g_off2d_path.y[g_off2d_path.n - 1];
+    }
     for (int i = 1; i <= 20; i++)
     {
         float t = i / 20.0f, mt = 1.0f - t;
@@ -4457,6 +5749,12 @@ static JSValue js_ctx2d_bezierCurveTo(JSContext *ctx, JSValueConst tv, int argc,
         float by = mt * mt * mt * sy + 3 * mt * mt * t * (float)y1 + 3 * mt * t * t * (float)y2 + t * t * t * (float)y;
         if (ctx2d_is_onscreen(ctx, tv))
             mini_2d_line_to(bx, by);
+        else if (g_off2d_path.n < OFF2D_MAX_PTS)
+        {
+            g_off2d_path.x[g_off2d_path.n] = bx;
+            g_off2d_path.y[g_off2d_path.n] = by;
+            g_off2d_path.n++;
+        }
     }
     return JS_UNDEFINED;
 }
@@ -4478,6 +5776,21 @@ static JSValue js_ctx2d_arcTo(JSContext *ctx, JSValueConst tv, int argc, JSValue
         mini_2d_line_to((float)x1, (float)y1);
         mini_2d_line_to((float)x2, (float)y2);
     }
+    else
+    {
+        if (g_off2d_path.n < OFF2D_MAX_PTS)
+        {
+            g_off2d_path.x[g_off2d_path.n] = (float)x1;
+            g_off2d_path.y[g_off2d_path.n] = (float)y1;
+            g_off2d_path.n++;
+        }
+        if (g_off2d_path.n < OFF2D_MAX_PTS)
+        {
+            g_off2d_path.x[g_off2d_path.n] = (float)x2;
+            g_off2d_path.y[g_off2d_path.n] = (float)y2;
+            g_off2d_path.n++;
+        }
+    }
     return JS_UNDEFINED;
 }
 static JSValue js_ctx2d_ellipse(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
@@ -4495,19 +5808,27 @@ static JSValue js_ctx2d_ellipse(JSContext *ctx, JSValueConst tv, int argc, JSVal
     JS_ToFloat64(ctx, &a1, argv[6]);
     if (argc > 7)
         JS_ToInt32(ctx, &ccw, argv[7]);
-    if (ctx2d_is_onscreen(ctx, tv))
+    int steps = 32;
+    float da = (float)(a1 - a0) / steps;
+    for (int i = 0; i <= steps; i++)
     {
-        int steps = 32;
-        float da = (float)(a1 - a0) / steps;
-        for (int i = 0; i <= steps; i++)
+        float a = (float)a0 + i * da;
+        float px = (float)(cx + rx * cos(a) * cos(rot) - ry * sin(a) * sin(rot));
+        float py = (float)(cy + rx * cos(a) * sin(rot) + ry * sin(a) * cos(rot));
+        if (ctx2d_is_onscreen(ctx, tv))
         {
-            float a = (float)a0 + i * da;
-            float px = (float)(cx + rx * cos(a) * cos(rot) - ry * sin(a) * sin(rot));
-            float py = (float)(cy + rx * cos(a) * sin(rot) + ry * sin(a) * cos(rot));
             if (i == 0)
                 mini_2d_move_to(px, py);
             else
                 mini_2d_line_to(px, py);
+        }
+        else if (g_off2d_path.n < OFF2D_MAX_PTS)
+        {
+            if (i == 0)
+                g_off2d_path.sub_start = g_off2d_path.n;
+            g_off2d_path.x[g_off2d_path.n] = px;
+            g_off2d_path.y[g_off2d_path.n] = py;
+            g_off2d_path.n++;
         }
     }
     return JS_UNDEFINED;
@@ -4528,6 +5849,28 @@ static JSValue js_ctx2d_rect(JSContext *ctx, JSValueConst tv, int argc, JSValueC
         mini_2d_line_to((float)(x + w), (float)(y + h));
         mini_2d_line_to((float)x, (float)(y + h));
         mini_2d_close_path();
+    }
+    else
+    {
+        if (g_off2d_path.n + 5 <= OFF2D_MAX_PTS)
+        {
+            g_off2d_path.sub_start = g_off2d_path.n;
+            g_off2d_path.x[g_off2d_path.n] = (float)x;
+            g_off2d_path.y[g_off2d_path.n] = (float)y;
+            g_off2d_path.n++;
+            g_off2d_path.x[g_off2d_path.n] = (float)(x + w);
+            g_off2d_path.y[g_off2d_path.n] = (float)y;
+            g_off2d_path.n++;
+            g_off2d_path.x[g_off2d_path.n] = (float)(x + w);
+            g_off2d_path.y[g_off2d_path.n] = (float)(y + h);
+            g_off2d_path.n++;
+            g_off2d_path.x[g_off2d_path.n] = (float)x;
+            g_off2d_path.y[g_off2d_path.n] = (float)(y + h);
+            g_off2d_path.n++;
+            g_off2d_path.x[g_off2d_path.n] = (float)x;
+            g_off2d_path.y[g_off2d_path.n] = (float)y;
+            g_off2d_path.n++;
+        }
     }
     return JS_UNDEFINED;
 }
@@ -4944,13 +6287,117 @@ static JSValue js_ctx2d_putImageData(JSContext *ctx, JSValueConst tv, int argc, 
     JS_FreeValue(ctx, data_arr);
     return JS_UNDEFINED;
 }
+static const void *js_extract_tex_image_source(JSContext *ctx, JSValueConst src, int *out_w, int *out_h, uint8_t **out_temp, int *out_stbi);
+
 static JSValue js_ctx2d_drawImage(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
-    /* drawImage needs image sources backed by textures (Stage 4). No-op. */
-    (void)ctx;
-    (void)tv;
-    (void)argc;
-    (void)argv;
+    if (argc < 3)
+        return JS_UNDEFINED;
+
+    int cw = 0, ch = 0;
+    uint8_t *dst_buf = ctx2d_get_canvas_buffer(ctx, tv, &cw, &ch);
+    if (!dst_buf || cw <= 0 || ch <= 0)
+        return JS_UNDEFINED;
+
+    int img_w = 0, img_h = 0;
+    uint8_t *temp_px = NULL;
+    int stbi_allocated = 0;
+    const uint8_t *src_px = (const uint8_t *)js_extract_tex_image_source(ctx, argv[0], &img_w, &img_h, &temp_px, &stbi_allocated);
+    if (!src_px || img_w <= 0 || img_h <= 0)
+    {
+        if (stbi_allocated && src_px) stbi_image_free((void *)src_px);
+        if (temp_px) free(temp_px);
+        return JS_UNDEFINED;
+    }
+
+    double sx = 0, sy = 0, sw = img_w, sh = img_h;
+    double dx = 0, dy = 0, dw = img_w, dh = img_h;
+
+    if (argc >= 9)
+    {
+        JS_ToFloat64(ctx, &sx, argv[1]);
+        JS_ToFloat64(ctx, &sy, argv[2]);
+        JS_ToFloat64(ctx, &sw, argv[3]);
+        JS_ToFloat64(ctx, &sh, argv[4]);
+        JS_ToFloat64(ctx, &dx, argv[5]);
+        JS_ToFloat64(ctx, &dy, argv[6]);
+        JS_ToFloat64(ctx, &dw, argv[7]);
+        JS_ToFloat64(ctx, &dh, argv[8]);
+    }
+    else if (argc >= 5)
+    {
+        JS_ToFloat64(ctx, &dx, argv[1]);
+        JS_ToFloat64(ctx, &dy, argv[2]);
+        JS_ToFloat64(ctx, &dw, argv[3]);
+        JS_ToFloat64(ctx, &dh, argv[4]);
+    }
+    else
+    {
+        JS_ToFloat64(ctx, &dx, argv[1]);
+        JS_ToFloat64(ctx, &dy, argv[2]);
+    }
+
+    int idx0 = (int)dx, idy0 = (int)dy;
+    int idw = (int)dw, idh = (int)dh;
+    if (idw <= 0 || idh <= 0)
+    {
+        if (stbi_allocated && src_px) stbi_image_free((void *)src_px);
+        if (temp_px) free(temp_px);
+        return JS_UNDEFINED;
+    }
+
+    int x_start = idx0 < 0 ? 0 : idx0;
+    int y_start = idy0 < 0 ? 0 : idy0;
+    int x_end = (idx0 + idw) > cw ? cw : (idx0 + idw);
+    int y_end = (idy0 + idh) > ch ? ch : (idy0 + idh);
+
+    if ((int)sw == idw && (int)sh == idh && (int)sx == 0 && (int)sy == 0)
+    {
+        /* 1:1 blit fast path */
+        for (int y = y_start; y < y_end; y++)
+        {
+            int sy_idx = y - idy0;
+            if (sy_idx < 0 || sy_idx >= img_h) continue;
+            int s_x = x_start - idx0;
+            int copy_w = x_end - x_start;
+            if (s_x < 0) { copy_w += s_x; s_x = 0; }
+            if (s_x + copy_w > img_w) copy_w = img_w - s_x;
+            if (copy_w <= 0) continue;
+            const uint8_t *s = src_px + (sy_idx * img_w + s_x) * 4;
+            uint8_t *d = dst_buf + (y * cw + x_start) * 4;
+            memcpy(d, s, (size_t)copy_w * 4);
+        }
+    }
+    else
+    {
+        /* Scaled sampling */
+        for (int y = y_start; y < y_end; y++)
+        {
+            int src_y = (int)(sy + ((double)(y - idy0) / (double)idh) * sh);
+            if (src_y < 0) src_y = 0;
+            if (src_y >= img_h) src_y = img_h - 1;
+            const uint8_t *src_row = src_px + src_y * img_w * 4;
+            uint8_t *dst_row = dst_buf + (y * cw) * 4;
+            for (int x = x_start; x < x_end; x++)
+            {
+                int src_x = (int)(sx + ((double)(x - idx0) / (double)idw) * sw);
+                if (src_x < 0) src_x = 0;
+                if (src_x >= img_w) src_x = img_w - 1;
+                const uint8_t *sp = src_row + src_x * 4;
+                uint8_t *dp = dst_row + x * 4;
+                dp[0] = sp[0];
+                dp[1] = sp[1];
+                dp[2] = sp[2];
+                dp[3] = sp[3];
+            }
+        }
+    }
+
+    if (stbi_allocated && src_px)
+        stbi_image_free((void *)src_px);
+    if (temp_px)
+        free(temp_px);
+
     return JS_UNDEFINED;
 }
 
@@ -4975,6 +6422,14 @@ static GLuint js_gl_get_object_id(JSContext *ctx, JSValueConst v)
     JS_ToInt32(ctx, &id, v);
     return (GLuint)id;
 }
+static JSValue js_gl_make_object(JSContext *ctx, GLuint id)
+{
+    if (id == 0)
+        return JS_NULL;
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "__id", JS_NewInt32(ctx, (int32_t)id));
+    return obj;
+}
 
 /* getTypedData: pulls a raw pointer + length out of a TypedArray.     */
 /* ----------------------------------------------------------------- */
@@ -4997,6 +6452,7 @@ static const void *js_typed_data(JSContext *ctx, JSValueConst v, size_t *out_len
     else
     {
         JS_FreeValue(ctx, ab);
+        JS_FreeValue(ctx, JS_GetException(ctx));
     }
     size_t ab_size = 0;
     uint8_t *p = JS_GetArrayBuffer(ctx, &ab_size, v);
@@ -5083,6 +6539,270 @@ static JSValue js_gl_createShader(JSContext *ctx, JSValueConst tv, int argc, JSV
     GLuint s = b->gl->CreateShader ? b->gl->CreateShader(t) : 0;
     return JS_NewInt32(ctx, (int32_t)s);
 }
+static char *glsl_fixup_threejs_lights(const char *src)
+{
+    if (!src)
+        return NULL;
+
+    /* Check if shader uses directionalLights, hemisphereLights, pointLights, spotLights */
+    if (!strstr(src, "directionalLights[") && !strstr(src, "directionalLights [") &&
+        !strstr(src, "hemisphereLights[") && !strstr(src, "hemisphereLights [") &&
+        !strstr(src, "pointLights[") && !strstr(src, "pointLights [") &&
+        !strstr(src, "spotLights[") && !strstr(src, "spotLights ["))
+    {
+        return NULL; /* no rewrite needed */
+    }
+
+    size_t src_len = strlen(src);
+    size_t out_cap = src_len * 2 + 16384;
+    char *out = (char *)malloc(out_cap);
+    if (!out)
+        return NULL;
+
+    const char *p = src;
+    char *d = out;
+
+    while (*p)
+    {
+        /* 1. directionalLight = directionalLights[ ... ]; */
+        if (!strncmp(p, "directionalLight", 16) && (p[16] == ' ' || p[16] == '='))
+        {
+            const char *q = p + 16;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '=')
+            {
+                q++;
+                while (*q == ' ' || *q == '\t') q++;
+                if (!strncmp(q, "directionalLights", 17))
+                {
+                    q += 17;
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (*q == '[')
+                    {
+                        q++;
+                        while (*q == ' ' || *q == '\t') q++;
+                        char *endp = NULL;
+                        long idx = strtol(q, &endp, 10);
+                        if (endp && endp != q)
+                        {
+                            q = endp;
+                            while (*q == ' ' || *q == '\t') q++;
+                            if (*q == ']')
+                            {
+                                q++;
+                                while (*q == ' ' || *q == '\t') q++;
+                                if (*q == ';')
+                                {
+                                    q++; /* matched full "directionalLight = directionalLights[ <idx> ];" */
+                                    int w = snprintf(d, out_cap - (d - out),
+                                                     "directionalLight.direction = directionalLights[%ld].direction; "
+                                                     "directionalLight.color = directionalLights[%ld].color;",
+                                                     idx, idx);
+                                    d += w;
+                                    p = q;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 2. directionalLightShadow = directionalLightShadows[ ... ]; */
+        if (!strncmp(p, "directionalLightShadow", 22) && (p[22] == ' ' || p[22] == '='))
+        {
+            const char *q = p + 22;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '=')
+            {
+                q++;
+                while (*q == ' ' || *q == '\t') q++;
+                if (!strncmp(q, "directionalLightShadows", 23))
+                {
+                    q += 23;
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (*q == '[')
+                    {
+                        q++;
+                        while (*q == ' ' || *q == '\t') q++;
+                        char *endp = NULL;
+                        long idx = strtol(q, &endp, 10);
+                        if (endp && endp != q)
+                        {
+                            q = endp;
+                            while (*q == ' ' || *q == '\t') q++;
+                            if (*q == ']')
+                            {
+                                q++;
+                                while (*q == ' ' || *q == '\t') q++;
+                                if (*q == ';')
+                                {
+                                    q++;
+                                    int w = snprintf(d, out_cap - (d - out),
+                                                     "directionalLightShadow.shadowBias = directionalLightShadows[%ld].shadowBias; "
+                                                     "directionalLightShadow.shadowRadius = directionalLightShadows[%ld].shadowRadius; "
+                                                     "directionalLightShadow.shadowMapSize = directionalLightShadows[%ld].shadowMapSize;",
+                                                     idx, idx, idx);
+                                    d += w;
+                                    p = q;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 3. pointLight = pointLights[ ... ]; */
+        if (!strncmp(p, "pointLight", 10) && (p[10] == ' ' || p[10] == '='))
+        {
+            const char *q = p + 10;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '=')
+            {
+                q++;
+                while (*q == ' ' || *q == '\t') q++;
+                if (!strncmp(q, "pointLights", 11))
+                {
+                    q += 11;
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (*q == '[')
+                    {
+                        q++;
+                        while (*q == ' ' || *q == '\t') q++;
+                        char *endp = NULL;
+                        long idx = strtol(q, &endp, 10);
+                        if (endp && endp != q)
+                        {
+                            q = endp;
+                            while (*q == ' ' || *q == '\t') q++;
+                            if (*q == ']')
+                            {
+                                q++;
+                                while (*q == ' ' || *q == '\t') q++;
+                                if (*q == ';')
+                                {
+                                    q++;
+                                    int w = snprintf(d, out_cap - (d - out),
+                                                     "pointLight.position = pointLights[%ld].position; "
+                                                     "pointLight.color = pointLights[%ld].color; "
+                                                     "pointLight.distance = pointLights[%ld].distance; "
+                                                     "pointLight.decay = pointLights[%ld].decay;",
+                                                     idx, idx, idx, idx);
+                                    d += w;
+                                    p = q;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 4. spotLight = spotLights[ ... ]; */
+        if (!strncmp(p, "spotLight", 9) && (p[9] == ' ' || p[9] == '='))
+        {
+            const char *q = p + 9;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '=')
+            {
+                q++;
+                while (*q == ' ' || *q == '\t') q++;
+                if (!strncmp(q, "spotLights", 10))
+                {
+                    q += 10;
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (*q == '[')
+                    {
+                        q++;
+                        while (*q == ' ' || *q == '\t') q++;
+                        char *endp = NULL;
+                        long idx = strtol(q, &endp, 10);
+                        if (endp && endp != q)
+                        {
+                            q = endp;
+                            while (*q == ' ' || *q == '\t') q++;
+                            if (*q == ']')
+                            {
+                                q++;
+                                while (*q == ' ' || *q == '\t') q++;
+                                if (*q == ';')
+                                {
+                                    q++;
+                                    int w = snprintf(d, out_cap - (d - out),
+                                                     "spotLight.position = spotLights[%ld].position; "
+                                                     "spotLight.direction = spotLights[%ld].direction; "
+                                                     "spotLight.color = spotLights[%ld].color; "
+                                                     "spotLight.distance = spotLights[%ld].distance; "
+                                                     "spotLight.decay = spotLights[%ld].decay; "
+                                                     "spotLight.coneCos = spotLights[%ld].coneCos; "
+                                                     "spotLight.penumbraCos = spotLights[%ld].penumbraCos;",
+                                                     idx, idx, idx, idx, idx, idx, idx);
+                                    d += w;
+                                    p = q;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 5. getHemisphereLightIrradiance( hemisphereLights[ ... ], */
+        if (!strncmp(p, "getHemisphereLightIrradiance", 28))
+        {
+            const char *q = p + 28;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '(')
+            {
+                q++;
+                while (*q == ' ' || *q == '\t') q++;
+                if (!strncmp(q, "hemisphereLights", 16))
+                {
+                    q += 16;
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (*q == '[')
+                    {
+                        q++;
+                        while (*q == ' ' || *q == '\t') q++;
+                        char *endp = NULL;
+                        long idx = strtol(q, &endp, 10);
+                        if (endp && endp != q)
+                        {
+                            q = endp;
+                            while (*q == ' ' || *q == '\t') q++;
+                            if (*q == ']')
+                            {
+                                q++;
+                                while (*q == ' ' || *q == '\t') q++;
+                                if (*q == ',')
+                                {
+                                    q++; /* consumed up to ',' after hemisphereLights[...] */
+                                    int w = snprintf(d, out_cap - (d - out),
+                                                     "getHemisphereLightIrradiance(HemisphereLight(hemisphereLights[%ld].direction, "
+                                                     "hemisphereLights[%ld].skyColor, hemisphereLights[%ld].groundColor),",
+                                                     idx, idx, idx);
+                                    d += w;
+                                    p = q;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        *d++ = *p++;
+    }
+    *d = '\0';
+    return out;
+}
+
 static JSValue js_gl_shaderSource(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
@@ -5093,12 +6813,15 @@ static JSValue js_gl_shaderSource(JSContext *ctx, JSValueConst tv, int argc, JSV
     const char *src = JS_ToCString(ctx, argv[1]);
     if (src && b->gl->ShaderSource)
     {
+        char *fixed = glsl_fixup_threejs_lights(src);
+        const GLchar *s = fixed ? fixed : src;
         char fname[64];
         snprintf(fname, sizeof(fname), "build/shader_%u.glsl", (unsigned)sh);
         FILE *fp = fopen(fname, "w");
-        if (fp) { fputs(src, fp); fclose(fp); }
-        const GLchar *s = src;
+        if (fp) { fputs(s, fp); fclose(fp); }
         b->gl->ShaderSource(sh, 1, &s, NULL);
+        if (fixed)
+            free(fixed);
     }
     JS_FreeCString(ctx, src);
     return JS_UNDEFINED;
@@ -5138,6 +6861,7 @@ static JSValue js_gl_attachShader(JSContext *ctx, JSValueConst tv, int argc, JSV
     int32_t p, s;
     JS_ToInt32(ctx, &p, argv[0]);
     JS_ToInt32(ctx, &s, argv[1]);
+    mini_logf(MINI_LOG_INFO, "gl", "attachShader prog=%d shader=%d", p, s);
     if (b->gl->AttachShader)
         b->gl->AttachShader((GLuint)p, (GLuint)s);
     return JS_UNDEFINED;
@@ -5184,6 +6908,7 @@ static JSValue js_gl_getActiveUniform(JSContext *ctx, JSValueConst tv,
         fn((GLuint)program, (GLuint)index, (GLsizei)(sizeof(name) - 1),
            NULL, &size, &type, name);
     name[sizeof(name) - 1] = 0;
+    mini_logf(MINI_LOG_INFO, "gl", "getActiveUniform prog=%d idx=%d: name='%s' size=%d type=0x%x", program, index, name, size, type);
     JSValue o = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, o, "name", JS_NewString(ctx, name));
     JS_SetPropertyStr(ctx, o, "size", JS_NewInt32(ctx, size));
@@ -5253,7 +6978,7 @@ static JSValue js_gl_createBuffer(JSContext *ctx, JSValueConst tv, int argc, JSV
     GLuint id = 0;
     if (b->gl->GenBuffers)
         b->gl->GenBuffers(1, &id);
-    return JS_NewInt32(ctx, (int32_t)id);
+    return js_gl_make_object(ctx, id);
 }
 static JSValue js_gl_bindBuffer(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
@@ -5334,17 +7059,28 @@ static JSValue js_gl_vertexAttribPointer(JSContext *ctx, JSValueConst tv, int ar
 static JSValue js_gl_drawArrays(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
-    int32_t mode, first, count;
-    JS_ToInt32(ctx, &mode, argv[0]);
-    JS_ToInt32(ctx, &first, argv[1]);
-    JS_ToInt32(ctx, &count, argv[2]);
-    if (b->gl->DrawArrays)
+    int32_t mode = 0, first = 0, count = 0;
+    if (argc > 0) JS_ToInt32(ctx, &mode, argv[0]);
+    if (argc > 1) JS_ToInt32(ctx, &first, argv[1]);
+    if (argc > 2) JS_ToInt32(ctx, &count, argv[2]);
+    if (count <= 0)
+        return JS_UNDEFINED;
+    if (b && b->gl && b->r && b->r->gpu.is_vulkan && b->gl->current_fbo == 0)
+    {
+        if (!b->gl->vk_fbo)
+            mini_gl_ensure_vk_fbo(b->gl, b->r->gpu.width, b->r->gpu.height);
+        if (b->gl->BindFramebuffer && b->gl->vk_fbo)
+            b->gl->BindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, b->gl->vk_fbo);
+    }
+    if (b && b->gl && b->gl->DrawArrays)
         b->gl->DrawArrays((GLenum)mode, (GLint)first, (GLsizei)count);
     else
         glDrawArrays((GLenum)mode, (GLint)first, (GLsizei)count);
-    GLenum err = glGetError();
-    if (err)
-        fprintf(stderr, "[gl-err] drawArrays error=0x%X (%d), fbo=%u\n", (unsigned)err, (int)err, (unsigned)(b->gl ? b->gl->current_fbo : 0));
+    if (b && b->gl)
+    {
+        b->gl->webgl_drawn = 1;
+        b->gl->webgl_dirty = 1;
+    }
     return JS_UNDEFINED;
 }
 static JSValue js_gl_scissor(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
@@ -5372,14 +7108,25 @@ static JSValue js_gl_viewport(JSContext *ctx, JSValueConst tv, int argc, JSValue
         glViewport(x, y, w, h);
         return JS_UNDEFINED;
     }
-    /* canvas-anchored compositing: translate canvas-local GL coords (bottom-left
-       origin) into the canvas's window rect, and scissor draws to that rect so
-       WebGL renders INTO the canvas region, not the whole window. */
     JSValue cvj = JS_GetPropertyStr(ctx, tv, "_cv");
     struct MiniNode *cv = (!JS_IsNull(cvj) && !JS_IsUndefined(cvj))
                               ? (struct MiniNode *)JS_GetOpaque2(ctx, cvj, b->el_cid)
                               : NULL;
     JS_FreeValue(ctx, cvj);
+    if (b && b->gl && cv)
+        b->gl->webgl_canvas = cv;
+    if (b && b->gl && b->r && b->r->gpu.is_vulkan)
+    {
+        mini_gl_ensure_vk_fbo(b->gl, w > 0 ? w : b->r->gpu.width, h > 0 ? h : b->r->gpu.height);
+        if (b->gl->BindFramebuffer && b->gl->vk_fbo)
+            b->gl->BindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, b->gl->vk_fbo);
+        glViewport(0, 0, b->gl->vk_fbo_w, b->gl->vk_fbo_h);
+        glDisable(GL_SCISSOR_TEST);
+        return JS_UNDEFINED;
+    }
+    /* canvas-anchored compositing: translate canvas-local GL coords (bottom-left
+       origin) into the canvas's window rect, and scissor draws to that rect so
+       WebGL renders INTO the canvas region, not the whole window. */
     if (cv && cv->style.w > 0 && cv->style.h > 0)
     {
         int wh = b->r->gpu.height;
@@ -5425,11 +7172,22 @@ static JSValue js_gl_clear(JSContext *ctx, JSValueConst tv, int argc, JSValueCon
     MiniBridge *b = bridge_of(ctx);
     if (b && b->gl && b->gl->current_fbo == 0)
     {
-        /* When rendering to default framebuffer (screen), if WebGL clear color is transparent (alpha <= 0),
-           do NOT wipe out the HTML page backdrop with solid black! Only clear depth/stencil. */
-        if (b->gl->has_clear && b->gl->clear_a <= 0.001f)
+        if (b->r && b->r->gpu.is_vulkan)
         {
-            mask &= ~GL_COLOR_BUFFER_BIT;
+            if (!b->gl->vk_fbo)
+                mini_gl_ensure_vk_fbo(b->gl, b->r->gpu.width, b->r->gpu.height);
+            if (b->gl->BindFramebuffer && b->gl->vk_fbo)
+                b->gl->BindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, b->gl->vk_fbo);
+            b->gl->webgl_dirty = 1;
+        }
+        else
+        {
+            /* When rendering to default framebuffer (screen) in legacy GL mode, if WebGL clear color is transparent (alpha <= 0),
+               do NOT wipe out the HTML page backdrop with solid black! Only clear depth/stencil. */
+            if (b->gl->has_clear && b->gl->clear_a <= 0.001f)
+            {
+                mask &= ~GL_COLOR_BUFFER_BIT;
+            }
         }
     }
     if (mask)
@@ -5445,6 +7203,8 @@ static JSValue js_gl_getUniformLocation(JSContext *ctx, JSValueConst tv, int arg
     GLint loc = -1;
     if (name && b->gl->GetUniformLocation)
         loc = b->gl->GetUniformLocation((GLuint)p, name);
+    if (name && (strstr(name, "Light") || strstr(name, "light") || strstr(name, "diffuse") || strstr(name, "color") || strstr(name, "Color")))
+        mini_logf(MINI_LOG_INFO, "gl", "getUniformLocation prog=%d name='%s' -> loc=%d", p, name, loc);
     JS_FreeCString(ctx, name);
     if (loc < 0)
         return JS_NULL;
@@ -5552,7 +7312,7 @@ static JSValue js_gl_createTexture(JSContext *ctx, JSValueConst tv, int argc, JS
     GLuint id = 0;
     if (b->gl->GenTextures)
         b->gl->GenTextures(1, &id);
-    return JS_NewInt32(ctx, (int32_t)id);
+    return js_gl_make_object(ctx, id);
 }
 static JSValue js_gl_bindTexture(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
@@ -5848,9 +7608,26 @@ static JSValue js_gl_texImage2D(JSContext *ctx, JSValueConst tv, int argc, JSVal
     }
     else if (fmt == 0x8C40 /*GL_SRGB_EXT*/ || fmt == 0x8C41 /*GL_SRGB8*/)
     {
-        fmt = 0x1907 /*GL_RGB*/;
-        if (ifmt == 0x1907 || ifmt == 0x8C40)
-            ifmt = 0x8C41 /*GL_SRGB8*/;
+        if (argc < 8 || len == (size_t)w * (size_t)h * 4)
+        {
+            fmt = 0x1908 /*GL_RGBA*/;
+            ifmt = 0x8C43 /*GL_SRGB8_ALPHA8*/;
+        }
+        else
+        {
+            fmt = 0x1907 /*GL_RGB*/;
+            if (ifmt == 0x1907 || ifmt == 0x8C40)
+                ifmt = 0x8C41 /*GL_SRGB8*/;
+        }
+    }
+    else if (fmt == 0x1907 /*GL_RGB*/)
+    {
+        if (argc < 8 || len == (size_t)w * (size_t)h * 4)
+        {
+            fmt = 0x1908 /*GL_RGBA*/;
+            if (ifmt == 0x1907 || ifmt == 0x8051)
+                ifmt = 0x8058 /*GL_RGBA8*/;
+        }
     }
     else if (ifmt == 0x8C42 /*GL_SRGB_ALPHA_EXT*/)
     {
@@ -5865,6 +7642,9 @@ static JSValue js_gl_texImage2D(JSContext *ctx, JSValueConst tv, int argc, JSVal
         target = 0x0DE1 /*GL_TEXTURE_2D*/;
     if (w <= 0) w = 1;
     if (h <= 0) h = 1;
+
+    mini_logf(MINI_LOG_INFO, "tex", "texImage2D target=0x%x level=%d ifmt=0x%x fmt=0x%x type=0x%x w=%d h=%d px=%p",
+              target, level, ifmt, fmt, type, w, h, px);
 
     if (type == 0x8D61 /*HALF_FLOAT_OES*/ || type == 0x140B /*GL_HALF_FLOAT*/)
     {
@@ -5970,10 +7750,22 @@ static JSValue js_gl_drawElements(JSContext *ctx, JSValueConst tv, int argc, JSV
     JS_ToInt32(ctx, &count, argv[1]);
     JS_ToInt32(ctx, &type, argv[2]);
     JS_ToInt32(ctx, &off, argv[3]);
+    if (b && b->gl && b->r && b->r->gpu.is_vulkan && b->gl->current_fbo == 0)
+    {
+        if (!b->gl->vk_fbo)
+            mini_gl_ensure_vk_fbo(b->gl, b->r->gpu.width, b->r->gpu.height);
+        if (b->gl->BindFramebuffer && b->gl->vk_fbo)
+            b->gl->BindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, b->gl->vk_fbo);
+    }
     if (b && b->gl && b->gl->DrawElements)
         b->gl->DrawElements((GLenum)mode, (GLsizei)count, (GLenum)type, (const void *)(intptr_t)off);
     else
         glDrawElements((GLenum)mode, (GLsizei)count, (GLenum)type, (const void *)(intptr_t)off);
+    if (b && b->gl)
+    {
+        b->gl->webgl_drawn = 1;
+        b->gl->webgl_dirty = 1;
+    }
     return JS_UNDEFINED;
 }
 static JSValue js_gl_createVertexArray(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
@@ -5983,33 +7775,29 @@ static JSValue js_gl_createVertexArray(JSContext *ctx, JSValueConst tv, int argc
     PFN f = (PFN)glfwGetProcAddress("glGenVertexArrays");
     if (f)
         f(1, &id);
-    return JS_NewInt32(ctx, (int32_t)id);
+    return js_gl_make_object(ctx, id);
 }
 static JSValue js_gl_bindVertexArray(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
-    int32_t id;
-    JS_ToInt32(ctx, &id, argv[0]);
+    GLuint id = (argc > 0) ? js_gl_get_object_id(ctx, argv[0]) : 0;
     MiniBridge *b = bridge_of(ctx);
     if (b && b->gl && b->gl->BindVertexArray)
-        b->gl->BindVertexArray((GLuint)id);
+        b->gl->BindVertexArray(id);
     else
     {
         typedef void (*PFN)(GLuint);
         PFN f = (PFN)glfwGetProcAddress("glBindVertexArray");
         if (f)
-            f((GLuint)id);
+            f(id);
     }
     if (b && b->gl)
-        b->gl->last_vao = (GLuint)id;
+        b->gl->last_vao = id;
     return JS_UNDEFINED;
 }
 static JSValue js_gl_deleteVertexArray(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     (void)tv;
-    int32_t id = 0;
-    if (argc > 0)
-        JS_ToInt32(ctx, &id, argv[0]);
-    GLuint a = (GLuint)id;
+    GLuint a = (argc > 0) ? js_gl_get_object_id(ctx, argv[0]) : 0;
     typedef void (*PFN)(GLsizei, const GLuint *);
     PFN f = (PFN)glfwGetProcAddress("glDeleteVertexArrays");
     if (f && a)
@@ -6039,7 +7827,7 @@ static JSValue js_gl_createFramebuffer(JSContext *ctx, JSValueConst tv, int argc
     GLuint id = 0;
     if (b && b->gl && b->gl->GenFramebuffers)
         b->gl->GenFramebuffers(1, &id);
-    return JS_NewInt32(ctx, (int32_t)id);
+    return js_gl_make_object(ctx, id);
 }
 static JSValue js_gl_bindFramebuffer(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
@@ -6049,23 +7837,40 @@ static JSValue js_gl_bindFramebuffer(JSContext *ctx, JSValueConst tv, int argc, 
     GLuint id = (argc > 1) ? js_gl_get_object_id(ctx, argv[1]) : 0;
     if (b && b->gl)
         b->gl->current_fbo = id;
-    if (b && b->gl && b->gl->BindFramebuffer)
-        b->gl->BindFramebuffer((GLenum)target, id);
-    typedef void (*PFN_glDrawBuffer)(GLenum);
-    typedef void (*PFN_glReadBuffer)(GLenum);
-    typedef void (*PFN_glGetFramebufferAttachmentParameteriv)(GLenum, GLenum, GLenum, GLint *);
-    PFN_glDrawBuffer db = (PFN_glDrawBuffer)glfwGetProcAddress("glDrawBuffer");
-    PFN_glReadBuffer rb = (PFN_glReadBuffer)glfwGetProcAddress("glReadBuffer");
-    PFN_glGetFramebufferAttachmentParameteriv get_att = (PFN_glGetFramebufferAttachmentParameteriv)glfwGetProcAddress("glGetFramebufferAttachmentParameteriv");
-    if (id == 0)
+    GLuint hw_id = id;
+    if (id == 0 && b && b->gl && b->r && b->r->gpu.is_vulkan)
     {
-        if (db) db(GL_BACK); else glDrawBuffer(GL_BACK);
-        if (rb) rb(GL_BACK); else glReadBuffer(GL_BACK);
+        if (!b->gl->vk_fbo)
+            mini_gl_ensure_vk_fbo(b->gl, b->r->gpu.width, b->r->gpu.height);
+        hw_id = b->gl->vk_fbo;
+    }
+    if (b && b->gl && b->gl->BindFramebuffer)
+        b->gl->BindFramebuffer((GLenum)target, hw_id);
+    if (hw_id == 0)
+    {
+        if (b && b->gl && b->gl->DrawBuffers)
+        {
+            GLenum bk = GL_BACK;
+            b->gl->DrawBuffers(1, &bk);
+        }
+        else
+        {
+            glDrawBuffer(GL_BACK);
+        }
+        if (b && b->gl && b->gl->ReadBuffer)
+            b->gl->ReadBuffer(GL_BACK);
+        else
+            glReadBuffer(GL_BACK);
     }
     else
     {
-        if (db) db(0x8CE0 /*GL_COLOR_ATTACHMENT0*/); else glDrawBuffer(0x8CE0);
-        if (rb) rb(0x8CE0 /*GL_COLOR_ATTACHMENT0*/); else glReadBuffer(0x8CE0);
+        if (b && b->gl && b->gl->DrawBuffers)
+        {
+            GLenum c0 = 0x8CE0; /* GL_COLOR_ATTACHMENT0 */
+            b->gl->DrawBuffers(1, &c0);
+        }
+        if (b && b->gl && b->gl->ReadBuffer)
+            b->gl->ReadBuffer(0x8CE0);
     }
     return JS_UNDEFINED;
 }
@@ -6135,24 +7940,28 @@ static JSValue js_gl_checkFramebufferStatus(JSContext *ctx, JSValueConst tv, int
         st = b->gl->CheckFramebufferStatus((GLenum)target);
         if (st == 0x8CDB /* GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER */ || st == 0x8CD7 /* INCOMPLETE_MISSING_ATTACHMENT */)
         {
-            typedef void (*PFN_glDrawBuffer)(GLenum);
-            typedef void (*PFN_glReadBuffer)(GLenum);
-            PFN_glDrawBuffer db = (PFN_glDrawBuffer)glfwGetProcAddress("glDrawBuffer");
-            PFN_glReadBuffer rb = (PFN_glReadBuffer)glfwGetProcAddress("glReadBuffer");
-            if (db) db(GL_NONE); else glDrawBuffer(GL_NONE);
-            if (rb) rb(GL_NONE); else glReadBuffer(GL_NONE);
+            if (b && b->gl && b->gl->DrawBuffers)
+            {
+                GLenum no = GL_NONE;
+                b->gl->DrawBuffers(1, &no);
+            }
+            else
+            {
+                glDrawBuffer(GL_NONE);
+            }
+            if (b && b->gl && b->gl->ReadBuffer)
+                b->gl->ReadBuffer(GL_NONE);
+            else
+                glReadBuffer(GL_NONE);
             st = b->gl->CheckFramebufferStatus((GLenum)target);
         }
-        fprintf(stderr, "[fbo-check] checkFramebufferStatus FBO=%u -> 0x%X\n", (unsigned)(b->gl ? b->gl->current_fbo : 0), (unsigned)st);
     }
     return JS_NewInt32(ctx, (int32_t)st);
 }
 static JSValue js_gl_deleteFramebuffer(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
-    int32_t id;
-    JS_ToInt32(ctx, &id, argv[0]);
-    GLuint gid = (GLuint)id;
+    GLuint gid = (argc > 0) ? js_gl_get_object_id(ctx, argv[0]) : 0;
     if (b && b->gl && b->gl->DeleteFramebuffers && gid)
         b->gl->DeleteFramebuffers(1, &gid);
     return JS_UNDEFINED;
@@ -6163,7 +7972,7 @@ static JSValue js_gl_createRenderbuffer(JSContext *ctx, JSValueConst tv, int arg
     GLuint id = 0;
     if (b && b->gl && b->gl->GenRenderbuffers)
         b->gl->GenRenderbuffers(1, &id);
-    return JS_NewInt32(ctx, (int32_t)id);
+    return js_gl_make_object(ctx, id);
 }
 static JSValue js_gl_bindRenderbuffer(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
@@ -6218,12 +8027,13 @@ static JSValue js_gl_framebufferRenderbuffer(JSContext *ctx, JSValueConst tv, in
         }
         if (attach == 0x8CE0 /*GL_COLOR_ATTACHMENT0*/)
         {
-            typedef void (*PFN_glDrawBuffer)(GLenum);
-            typedef void (*PFN_glReadBuffer)(GLenum);
-            PFN_glDrawBuffer db = (PFN_glDrawBuffer)glfwGetProcAddress("glDrawBuffer");
-            PFN_glReadBuffer read_b = (PFN_glReadBuffer)glfwGetProcAddress("glReadBuffer");
-            if (db) db(0x8CE0 /*GL_COLOR_ATTACHMENT0*/); else glDrawBuffer(0x8CE0);
-            if (read_b) read_b(0x8CE0 /*GL_COLOR_ATTACHMENT0*/); else glReadBuffer(0x8CE0);
+            if (b && b->gl && b->gl->DrawBuffers)
+            {
+                GLenum c0 = 0x8CE0;
+                b->gl->DrawBuffers(1, &c0);
+            }
+            if (b && b->gl && b->gl->ReadBuffer)
+                b->gl->ReadBuffer(0x8CE0);
         }
     }
     return JS_UNDEFINED;
@@ -6231,9 +8041,7 @@ static JSValue js_gl_framebufferRenderbuffer(JSContext *ctx, JSValueConst tv, in
 static JSValue js_gl_deleteRenderbuffer(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
-    int32_t id;
-    JS_ToInt32(ctx, &id, argv[0]);
-    GLuint gid = (GLuint)id;
+    GLuint gid = (argc > 0) ? js_gl_get_object_id(ctx, argv[0]) : 0;
     if (b && b->gl && b->gl->DeleteRenderbuffers && gid)
         b->gl->DeleteRenderbuffers(1, &gid);
     return JS_UNDEFINED;
@@ -6243,9 +8051,7 @@ static JSValue js_gl_deleteRenderbuffer(JSContext *ctx, JSValueConst tv, int arg
 static JSValue js_gl_deleteTexture(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
-    int32_t id;
-    JS_ToInt32(ctx, &id, argv[0]);
-    GLuint gid = (GLuint)id;
+    GLuint gid = (argc > 0) ? js_gl_get_object_id(ctx, argv[0]) : 0;
     if (b && b->gl && b->gl->DeleteTextures && gid)
         b->gl->DeleteTextures(1, &gid);
     else if (gid)
@@ -6255,9 +8061,7 @@ static JSValue js_gl_deleteTexture(JSContext *ctx, JSValueConst tv, int argc, JS
 static JSValue js_gl_deleteBuffer(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     MiniBridge *b = bridge_of(ctx);
-    int32_t id;
-    JS_ToInt32(ctx, &id, argv[0]);
-    GLuint gid = (GLuint)id;
+    GLuint gid = (argc > 0) ? js_gl_get_object_id(ctx, argv[0]) : 0;
     if (b && b->gl && b->gl->DeleteBuffers && gid)
         b->gl->DeleteBuffers(1, &gid);
     return JS_UNDEFINED;
@@ -6296,6 +8100,7 @@ static JSValue js_gl_texSubImage2D(JSContext *ctx, JSValueConst tv, int argc, JS
     const void *px = NULL;
     uint8_t *temp_px = NULL;
     int stbi_allocated = 0;
+    size_t len = 0;
 
     if (argc >= 9)
     {
@@ -6307,7 +8112,6 @@ static JSValue js_gl_texSubImage2D(JSContext *ctx, JSValueConst tv, int argc, JS
         JS_ToInt32(ctx, &h, argv[5]);
         JS_ToInt32(ctx, &fmt, argv[6]);
         JS_ToInt32(ctx, &type, argv[7]);
-        size_t len = 0;
         if (!JS_IsUndefined(argv[8]) && !JS_IsNull(argv[8]))
             px = js_typed_data(ctx, argv[8], &len);
     }
@@ -6322,6 +8126,14 @@ static JSValue js_gl_texSubImage2D(JSContext *ctx, JSValueConst tv, int argc, JS
         JSValueConst src = (argc >= 7) ? argv[6] : JS_UNDEFINED;
         px = js_extract_tex_image_source(ctx, src, &w, &h, &temp_px, &stbi_allocated);
     }
+
+    if ((fmt == 0x1907 /*GL_RGB*/ || fmt == 0x8C40 /*GL_SRGB_EXT*/) && (argc < 9 || len == (size_t)w * (size_t)h * 4))
+    {
+        fmt = 0x1908 /*GL_RGBA*/;
+    }
+
+    mini_logf(MINI_LOG_INFO, "tex", "texSubImage2D target=0x%x level=%d xoff=%d yoff=%d fmt=0x%x type=0x%x w=%d h=%d px=%p",
+              target, level, xoff, yoff, fmt, type, w, h, px);
 
     if (w > 0 && h > 0)
     {
@@ -6782,9 +8594,9 @@ static JSValue js_gl_vertexAttrib4fv(JSContext *ctx, JSValueConst tv, int argc, 
 static JSValue js_gl_vertexAttribDivisor(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 { MiniBridge *b=bridge_of(ctx); if(argc<2)return JS_UNDEFINED; int32_t i=0,d=0; JS_ToInt32(ctx,&i,argv[0]); JS_ToInt32(ctx,&d,argv[1]); if(b&&b->gl&&b->gl->VertexAttribDivisor)b->gl->VertexAttribDivisor((GLuint)i,(GLuint)d); return JS_UNDEFINED; }
 static JSValue js_gl_drawArraysInstanced(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
-{ MiniBridge *b=bridge_of(ctx); if(argc<4)return JS_UNDEFINED; int32_t m=0,f=0,c=0,ic=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&f,argv[1]); JS_ToInt32(ctx,&c,argv[2]); JS_ToInt32(ctx,&ic,argv[3]); if(b&&b->gl&&b->gl->DrawArraysInstanced)b->gl->DrawArraysInstanced((GLenum)m,(GLint)f,(GLsizei)c,(GLsizei)ic); return JS_UNDEFINED; }
+{ MiniBridge *b=bridge_of(ctx); if(argc<4)return JS_UNDEFINED; int32_t m=0,f=0,c=0,ic=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&f,argv[1]); JS_ToInt32(ctx,&c,argv[2]); JS_ToInt32(ctx,&ic,argv[3]); if(b&&b->gl&&b->gl->DrawArraysInstanced){b->gl->DrawArraysInstanced((GLenum)m,(GLint)f,(GLsizei)c,(GLsizei)ic); b->gl->webgl_drawn=1; b->gl->webgl_dirty=1;} return JS_UNDEFINED; }
 static JSValue js_gl_drawElementsInstanced(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
-{ MiniBridge *b=bridge_of(ctx); if(argc<5)return JS_UNDEFINED; int32_t m=0,c=0,t=0,ic=0; int64_t off=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&c,argv[1]); JS_ToInt32(ctx,&t,argv[2]); JS_ToInt64(ctx,&off,argv[3]); JS_ToInt32(ctx,&ic,argv[4]); if(b&&b->gl&&b->gl->DrawElementsInstanced)b->gl->DrawElementsInstanced((GLenum)m,(GLsizei)c,(GLenum)t,(const void*)(intptr_t)off,(GLsizei)ic); return JS_UNDEFINED; }
+{ MiniBridge *b=bridge_of(ctx); if(argc<5)return JS_UNDEFINED; int32_t m=0,c=0,t=0,ic=0; int64_t off=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&c,argv[1]); JS_ToInt32(ctx,&t,argv[2]); JS_ToInt64(ctx,&off,argv[3]); JS_ToInt32(ctx,&ic,argv[4]); if(b&&b->gl&&b->gl->DrawElementsInstanced){b->gl->DrawElementsInstanced((GLenum)m,(GLsizei)c,(GLenum)t,(const void*)(intptr_t)off,(GLsizei)ic); b->gl->webgl_drawn=1; b->gl->webgl_dirty=1;} return JS_UNDEFINED; }
 
 /* query helpers — Three.js probes these at WebGLRenderer construction */
 static JSValue js_gl_getParameter(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
@@ -6801,6 +8613,27 @@ static JSValue js_gl_getParameter(JSContext *ctx, JSValueConst tv, int argc, JSV
     glGetIntegerv((GLenum)pname, &iv);
     return JS_NewInt32(ctx, iv);
 }
+
+static JSValue js_gl_getSupportedExtensions(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    (void)tv; (void)argc; (void)argv;
+    static const char *exts[] = {
+        "OES_element_index_uint", "OES_texture_float", "OES_texture_float_linear",
+        "OES_texture_half_float", "OES_texture_half_float_linear",
+        "OES_standard_derivatives", "EXT_texture_filter_anisotropic",
+        "EXT_shader_texture_lod", "WEBGL_depth_texture",
+        "OES_vertex_array_object", "WEBGL_compressed_texture_s3tc",
+        "WEBGL_lose_context", "ANGLE_instanced_arrays",
+        "EXT_sRGB", "EXT_blend_minmax", "WEBGL_color_buffer_float",
+        "EXT_color_buffer_half_float", "WEBGL_draw_buffers", NULL};
+    JSValue arr = JS_NewArray(ctx);
+    for (int i = 0; exts[i]; i++)
+    {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewString(ctx, exts[i]));
+    }
+    return arr;
+}
+
 static JSValue js_gl_getExtension(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
 {
     const char *name = JS_ToCString(ctx, argv[0]);
@@ -6815,7 +8648,7 @@ static JSValue js_gl_getExtension(JSContext *ctx, JSValueConst tv, int argc, JSV
             "OES_vertex_array_object", "WEBGL_compressed_texture_s3tc",
             "WEBGL_lose_context", "ANGLE_instanced_arrays",
             "EXT_sRGB", "EXT_blend_minmax", "WEBGL_color_buffer_float",
-            "EXT_color_buffer_half_float", NULL};
+            "EXT_color_buffer_half_float", "WEBGL_draw_buffers", NULL};
         for (int i = 0; have[i]; i++)
             if (!strcmp(name, have[i]))
             {
@@ -6886,6 +8719,23 @@ static JSValue js_gl_getExtension(JSContext *ctx, JSValueConst tv, int argc, JSV
                         JS_SetPropertyStr(ctx, r, "drawArraysInstancedANGLE", fn);
                         fn = JS_GetPropertyStr(ctx, proto, "drawElementsInstanced");
                         JS_SetPropertyStr(ctx, r, "drawElementsInstancedANGLE", fn);
+                        JS_FreeValue(ctx, proto);
+                    }
+                }
+                if (!strcmp(name, "WEBGL_draw_buffers"))
+                {
+                    JS_SetPropertyStr(ctx, r, "COLOR_ATTACHMENT0_WEBGL", JS_NewInt32(ctx, 0x8CE0));
+                    JS_SetPropertyStr(ctx, r, "COLOR_ATTACHMENT1_WEBGL", JS_NewInt32(ctx, 0x8CE1));
+                    JS_SetPropertyStr(ctx, r, "COLOR_ATTACHMENT2_WEBGL", JS_NewInt32(ctx, 0x8CE2));
+                    JS_SetPropertyStr(ctx, r, "COLOR_ATTACHMENT3_WEBGL", JS_NewInt32(ctx, 0x8CE3));
+                    JS_SetPropertyStr(ctx, r, "DRAW_BUFFER0_WEBGL", JS_NewInt32(ctx, 0x8825));
+                    JS_SetPropertyStr(ctx, r, "MAX_COLOR_ATTACHMENTS_WEBGL", JS_NewInt32(ctx, 0x8CDF));
+                    JS_SetPropertyStr(ctx, r, "MAX_DRAW_BUFFERS_WEBGL", JS_NewInt32(ctx, 0x8824));
+                    JSValue proto = JS_GetPrototype(ctx, tv);
+                    if (!JS_IsException(proto) && !JS_IsNull(proto))
+                    {
+                        JSValue fn = JS_GetPropertyStr(ctx, proto, "drawBuffers");
+                        JS_SetPropertyStr(ctx, r, "drawBuffersWEBGL", fn);
                         JS_FreeValue(ctx, proto);
                     }
                 }
@@ -8192,11 +10042,137 @@ static JSValue js_mini_audio_queue_pcm(JSContext *ctx, JSValueConst tv, int argc
 {
     if (argc < 1) return JS_UNDEFINED;
     size_t len = 0;
-    const void *p = js_float_data(ctx, argv[0], &len);
+    float *p = (float *)js_float_data(ctx, argv[0], &len);
     if (p && len > 0)
     {
         size_t count = len / sizeof(float);
-        mini_audio_queue_pcm((const float *)p, count);
+        if (argc >= 2)
+        {
+            int32_t req = 0;
+            JS_ToInt32(ctx, &req, argv[1]);
+            if (req > 0 && (size_t)req < count)
+                count = (size_t)req;
+        }
+        for (size_t i = 0; i < count; i++)
+        {
+            if (p[i] > 0.95f || p[i] < -0.95f)
+                p[i] = tanhf(p[i]);
+        }
+        mini_audio_queue_pcm(p, count);
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_mini_audio_osc_block(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    (void)tv;
+    if (argc < 9) return JS_NewFloat64(ctx, 0.0);
+    size_t len = 0;
+    float *out = (float *)js_float_data(ctx, argv[0], &len);
+    int32_t n = 0, type = 0;
+    double sr = 44100.0, phase = 0.0, f0 = 440.0, f1 = 440.0, g0 = 1.0, g1 = 1.0;
+    JS_ToInt32(ctx, &n, argv[1]);
+    JS_ToFloat64(ctx, &sr, argv[2]);
+    JS_ToInt32(ctx, &type, argv[3]);
+    JS_ToFloat64(ctx, &phase, argv[4]);
+    JS_ToFloat64(ctx, &f0, argv[5]);
+    JS_ToFloat64(ctx, &f1, argv[6]);
+    JS_ToFloat64(ctx, &g0, argv[7]);
+    JS_ToFloat64(ctx, &g1, argv[8]);
+    if (!out || n <= 0 || (size_t)n > len / sizeof(float) || sr <= 0.0)
+        return JS_NewFloat64(ctx, phase);
+
+    const double two_pi = 6.28318530717958647692;
+    const double dt = 1.0 / sr;
+    const double inv_n = 1.0 / (double)n;
+    for (int i = 0; i < n; i++)
+    {
+        double frac = (double)i * inv_n;
+        double freq = f0 + (f1 - f0) * frac;
+        double gain = g0 + (g1 - g0) * frac;
+        phase += two_pi * freq * dt;
+        if (phase >= two_pi)
+            phase -= two_pi * floor(phase / two_pi);
+        double val;
+        if (type == 1)
+            val = 0.72 * sin(phase) + 0.22 * sin(3.0 * phase) + 0.06 * sin(5.0 * phase);
+        else if (type == 2)
+            val = 0.65 * sin(phase) - 0.25 * sin(2.0 * phase) + 0.10 * sin(3.0 * phase);
+        else if (type == 3)
+            val = 0.85 * sin(phase) - 0.10 * sin(3.0 * phase);
+        else
+            val = sin(phase);
+        out[i] = (float)(val * gain);
+    }
+    return JS_NewFloat64(ctx, phase);
+}
+
+static JSValue js_mini_audio_biquad_block(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    (void)tv;
+    if (argc < 7) return JS_UNDEFINED;
+    size_t blen = 0, slen = 0;
+    float *buf = (float *)js_float_data(ctx, argv[0], &blen);
+    int32_t n = 0, tp = 0;
+    double sr = 44100.0, f0 = 350.0, q = 1.0;
+    JS_ToInt32(ctx, &n, argv[1]);
+    JS_ToFloat64(ctx, &sr, argv[2]);
+    JS_ToInt32(ctx, &tp, argv[3]);
+    JS_ToFloat64(ctx, &f0, argv[4]);
+    JS_ToFloat64(ctx, &q, argv[5]);
+    float *st = (float *)js_float_data(ctx, argv[6], &slen);
+    if (!buf || !st || slen < 4 * sizeof(float) || n <= 0 || (size_t)n > blen / sizeof(float) || sr <= 0.0)
+        return JS_UNDEFINED;
+
+    double w0 = 6.28318530717958647692 * f0 / sr;
+    double cosW = cos(w0), sinW = sin(w0);
+    double alpha = sinW / (2.0 * (q > 0.01 ? q : 0.01));
+    double b0 = 1, b1 = 0, b2 = 0, a0 = 1, a1 = 0, a2 = 0;
+    if (tp == 0) { b0 = (1 - cosW) * 0.5; b1 = 1 - cosW; b2 = b0; a0 = 1 + alpha; a1 = -2 * cosW; a2 = 1 - alpha; }
+    else if (tp == 1) { b0 = (1 + cosW) * 0.5; b1 = -(1 + cosW); b2 = b0; a0 = 1 + alpha; a1 = -2 * cosW; a2 = 1 - alpha; }
+    else if (tp == 2) { b0 = alpha; b1 = 0; b2 = -alpha; a0 = 1 + alpha; a1 = -2 * cosW; a2 = 1 - alpha; }
+    else if (tp == 3) { b0 = 1; b1 = -2 * cosW; b2 = 1; a0 = 1 + alpha; a1 = -2 * cosW; a2 = 1 - alpha; }
+    else if (tp == 4) { b0 = 1 - alpha; b1 = -2 * cosW; b2 = 1 + alpha; a0 = 1 + alpha; a1 = -2 * cosW; a2 = 1 - alpha; }
+    else return JS_UNDEFINED;
+
+    double inv_a0 = 1.0 / a0;
+    double c_b0 = b0 * inv_a0, c_b1 = b1 * inv_a0, c_b2 = b2 * inv_a0;
+    double c_a1 = a1 * inv_a0, c_a2 = a2 * inv_a0;
+    double x1 = st[0], x2 = st[1], y1 = st[2], y2 = st[3];
+    for (int i = 0; i < n; i++)
+    {
+        double x = buf[i];
+        double y = c_b0 * x + c_b1 * x1 + c_b2 * x2 - c_a1 * y1 - c_a2 * y2;
+        if (!isfinite(y)) y = 0.0;
+        x2 = x1; x1 = x; y2 = y1; y1 = y;
+        buf[i] = (float)y;
+    }
+    st[0] = (float)x1; st[1] = (float)x2; st[2] = (float)y1; st[3] = (float)y2;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_mini_audio_mix_block(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
+{
+    (void)tv;
+    if (argc < 6) return JS_UNDEFINED;
+    size_t dlen = 0, slen = 0;
+    float *dst = (float *)js_float_data(ctx, argv[0], &dlen);
+    int32_t dst_off = 0, n = 0;
+    const float *src = (const float *)js_float_data(ctx, argv[2], &slen);
+    double g0 = 1.0, g1 = 1.0;
+    JS_ToInt32(ctx, &dst_off, argv[1]);
+    JS_ToInt32(ctx, &n, argv[3]);
+    JS_ToFloat64(ctx, &g0, argv[4]);
+    JS_ToFloat64(ctx, &g1, argv[5]);
+    if (!dst || !src || dst_off < 0 || n <= 0)
+        return JS_UNDEFINED;
+    if ((size_t)(dst_off + n) > dlen / sizeof(float) || (size_t)n > slen / sizeof(float))
+        return JS_UNDEFINED;
+    const double inv_n = 1.0 / (double)n;
+    for (int i = 0; i < n; i++)
+    {
+        double g = g0 + (g1 - g0) * ((double)i * inv_n);
+        dst[dst_off + i] += (float)((double)src[i] * g);
     }
     return JS_UNDEFINED;
 }
@@ -8306,7 +10282,13 @@ static void install_net_storage(JSContext *ctx, JSValue global)
     JS_SetPropertyStr(ctx, global, "__mini_audio_init",
                       JS_NewCFunction(ctx, (JSCFunction *)js_mini_audio_init, "__mini_audio_init", 2));
     JS_SetPropertyStr(ctx, global, "__mini_audio_queue_pcm",
-                      JS_NewCFunction(ctx, (JSCFunction *)js_mini_audio_queue_pcm, "__mini_audio_queue_pcm", 1));
+                      JS_NewCFunction(ctx, (JSCFunction *)js_mini_audio_queue_pcm, "__mini_audio_queue_pcm", 2));
+    JS_SetPropertyStr(ctx, global, "__mini_audio_osc_block",
+                      JS_NewCFunction(ctx, (JSCFunction *)js_mini_audio_osc_block, "__mini_audio_osc_block", 9));
+    JS_SetPropertyStr(ctx, global, "__mini_audio_biquad_block",
+                      JS_NewCFunction(ctx, (JSCFunction *)js_mini_audio_biquad_block, "__mini_audio_biquad_block", 7));
+    JS_SetPropertyStr(ctx, global, "__mini_audio_mix_block",
+                      JS_NewCFunction(ctx, (JSCFunction *)js_mini_audio_mix_block, "__mini_audio_mix_block", 6));
 
     JS_SetPropertyStr(ctx, global, "fetch",
                       JS_NewCFunction(ctx, (JSCFunction *)js_fetch, "fetch", 2));
@@ -8402,6 +10384,7 @@ static void install_element_proto(JSContext *ctx, JSClassID cid)
     SET(proto, "removeChild", js_removeChild, 1);
     SET(proto, "setAttribute", js_setAttribute, 2);
     SET(proto, "getAttribute", js_getAttribute, 1);
+    SET(proto, "_getAttributes", js_getAttributes, 0);
     SET(proto, "_setStyle", js_setStyle, 2);
     SET(proto, "_getText", js_getText, 0);
     SET(proto, "_setText", js_setText, 1);
@@ -8414,6 +10397,11 @@ static void install_element_proto(JSContext *ctx, JSClassID cid)
     SET(proto, "hasPointerCapture", js_hasPointerCapture, 1);
     SET(proto, "focus", js_focus, 0);
     SET(proto, "blur", js_blur, 0);
+    SET(proto, "_getSelStart", js_getSelStart, 0);
+    SET(proto, "_setSelStart", js_setSelStart, 1);
+    SET(proto, "_getSelEnd", js_getSelEnd, 0);
+    SET(proto, "_setSelEnd", js_setSelEnd, 1);
+    SET(proto, "setSelectionRange", js_setSelectionRange, 2);
     SET(proto, "removeAttribute", js_removeAttribute, 1);
     SET(proto, "insertBefore", js_insertBefore, 2);
     SET(proto, "cloneNode", js_cloneNode, 1);
@@ -8520,6 +10508,8 @@ static void install_webgl(JSContext *ctx, JSValue global)
     SET(proto, "readPixels", js_gl_readPixels, 7);
     SET(proto, "getParameter", js_gl_getParameter, 1);
     SET(proto, "getExtension", js_gl_getExtension, 1);
+    SET(proto, "getSupportedExtensions", js_gl_getSupportedExtensions, 0);
+    SET(proto, "drawBuffers", js_gl_drawBuffers, 1);
     SET(proto, "getContextAttributes", js_gl_getContextAttributes, 0);
     SET(proto, "getError", js_gl_getError, 0);
     SET(proto, "getShaderPrecisionFormat", js_gl_getShaderPrecisionFormat, 2);
@@ -9078,6 +11068,7 @@ MiniBridge *mini_bridge_create_ex(MiniRenderer *r, MiniDocument *doc, int is_ren
                       JS_NewCFunction(b->ctx, (JSCFunction *)js_exitPointerLock, "_exitPointerLock", 0));
     JS_SetPropertyStr(b->ctx, docobj, "_pointerLockElement",
                       JS_NewCFunction(b->ctx, (JSCFunction *)js_doc_pointerLockElement, "_pointerLockElement", 0));
+    JS_SetPropertyStr(b->ctx, docobj, "readyState", JS_NewString(b->ctx, "complete"));
     JS_SetPropertyStr(b->ctx, global, "document", docobj);
 
     /* fetch() + localStorage/sessionStorage (Network + Storage domains) */
@@ -9318,9 +11309,8 @@ void mini_bridge_destroy(MiniBridge *b)
         MiniNodeWrapper *w = b->all_wrappers[i];
         if (w)
         {
-            struct MiniNode *n = (struct MiniNode *)JS_GetOpaque(w->val, b->el_cid);
-            if (n && n->js_wrapper == w)
-                n->js_wrapper = NULL;
+            if (w->node && w->node->js_wrapper == w)
+                w->node->js_wrapper = NULL;
             JS_SetOpaque(w->val, NULL);
             JS_FreeValue(b->ctx, w->val);
             free(w);
@@ -9410,9 +11400,9 @@ void mini_bridge_set_events(MiniBridge *b, struct MiniEventState *ev)
     }
 }
 
-/* Phase 1.1+1.2: parse a raw HTML string into the live DOM, apply <style>
-   rules, then run every inline <script> in document order. */
-static void apply_styles(struct MiniNode *n, MiniBridge *b)
+/* Phase 1.1+1.2: parse a raw HTML string into the live DOM, accumulate all <style>
+   rules, and apply them in one combined pass to avoid redundant DOM re-styling. */
+static void collect_styles(struct MiniNode *n, char **buf, size_t *len, size_t *cap)
 {
     if (!n)
         return;
@@ -9420,10 +11410,48 @@ static void apply_styles(struct MiniNode *n, MiniBridge *b)
     {
         const char *css = (n->text && n->text[0]) ? n->text : (n->first_child && n->first_child->text ? n->first_child->text : NULL);
         if (css && css[0])
-            mini_css_apply(b->doc, css);
+        {
+            size_t clen = strlen(css);
+            if (*len + clen + 2 > *cap)
+            {
+                size_t ncap = (*cap == 0) ? (clen + 1024) : (*cap * 2 + clen + 2);
+                char *nb = (char *)realloc(*buf, ncap);
+                if (nb)
+                {
+                    *buf = nb;
+                    *cap = ncap;
+                }
+            }
+            if (*buf && *len + clen + 2 <= *cap)
+            {
+                if (*len > 0)
+                    (*buf)[(*len)++] = '\n';
+                memcpy(*buf + *len, css, clen);
+                *len += clen;
+                (*buf)[*len] = 0;
+            }
+        }
     }
     for (struct MiniNode *c = n->first_child; c; c = c->next_sibling)
-        apply_styles(c, b);
+        collect_styles(c, buf, len, cap);
+}
+
+static void apply_styles(struct MiniNode *n, MiniBridge *b)
+{
+    if (!n || !b || !b->doc)
+        return;
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    collect_styles(n, &buf, &len, &cap);
+    if (buf && len > 0)
+    {
+        mini_css_apply(b->doc, buf);
+        b->doc->dirty = 1;
+        b->doc->restyle_dirty = 1;
+        b->doc->layout_dirty = 1;
+        b->doc->paint_dirty = 1;
+    }
+    free(buf);
 }
 
 /* ================================================================== */
@@ -9953,7 +11981,10 @@ static void eval_scripts(struct MiniNode *n, MiniBridge *b)
                 MiniNetRecord rec;
                 memset(&rec, 0, sizeof rec);
                 mini_net_prefetch_await(remote_src);
-                if (mini_net_fetch("GET", remote_src, NULL, NULL, 0, NULL, &rec) == 0 && rec.resp_body)
+                int fetch_rc = mini_net_fetch("GET", remote_src, NULL, NULL, 0, NULL, &rec);
+                mini_logf(MINI_LOG_INFO, "net", "fetch script '%s': rc=%d, status=%d, body_len=%zu",
+                          remote_src, fetch_rc, rec.status, rec.resp_body_len);
+                if (fetch_rc == 0 && rec.resp_body)
                 {
                     mini_bridge_eval(b, rec.resp_body, rec.resp_body_len, remote_src);
                     mini_net_record_add(&rec);
@@ -10050,6 +12081,9 @@ int mini_bridge_load_html(MiniBridge *b, const char *html)
     if (!b || !html)
         return -1;
     mini_dom_parse_html(b->doc, html);
+    char dom_dump[4096];
+    mini_dom_serialize_html(b->doc, dom_dump, sizeof(dom_dump));
+    mini_logf(MINI_LOG_INFO, "dom", "Parsed HTML tree:\n%s", dom_dump);
     apply_styles(b->doc->root, b);
     eval_scripts(b->doc->root, b);
 
@@ -10058,8 +12092,12 @@ int mini_bridge_load_html(MiniBridge *b, const char *html)
        确保事件一定在下一帧准确拉起 JS 业务生命周期。 */
     const char *dispatch_script =
         "setTimeout(function() {"
+        "  document.readyState = 'complete';"
         "  var ev = new Event('DOMContentLoaded', {bubbles: true});"
         "  document.dispatchEvent(ev);"
+        "  var loadEv = new Event('load', {bubbles: false});"
+        "  window.dispatchEvent(loadEv);"
+        "  if (typeof window.onload === 'function') { try { window.onload(loadEv); } catch(e) { console.error(e); } }"
         "}, 10);";
     mini_bridge_eval(b, dispatch_script, strlen(dispatch_script), "<dom-ready-dispatcher>");
 
@@ -10076,6 +12114,7 @@ int mini_bridge_eval(MiniBridge *b, const char *src, size_t len, const char *fil
         JSValue stack = JS_GetPropertyStr(b->ctx, ex, "stack");
         const char *stk = JS_ToCString(b->ctx, stack);
         fprintf(stderr, "[eval error in %s] %s\n%s\n", filename ? filename : "?", s ? s : "?", stk ? stk : "");
+        mini_logf(MINI_LOG_ERROR, "js", "[eval error in %s] %s (stack: %s)", filename ? filename : "?", s ? s : "?", stk ? stk : "");
         if (stk)
             JS_FreeCString(b->ctx, stk);
         JS_FreeValue(b->ctx, stack);
@@ -10142,9 +12181,14 @@ void mini_bridge_pump(MiniBridge *b)
         {
             JSValue ex = JS_GetException(pctx);
             const char *msg = JS_ToCString(pctx, ex);
+            JSValue stack = JS_GetPropertyStr(pctx, ex, "stack");
+            const char *st = JS_ToCString(pctx, stack);
+            mini_logf(MINI_LOG_ERROR, "js", "[promise error] %s\n%s", msg ? msg : "exception", st ? st : "");
             fprintf(stderr, "[promise error] %s\n", msg ? msg : "exception");
             if (b->log_hook)
                 b->log_hook("error", msg ? msg : "promise error", b->log_ud);
+            if (st) JS_FreeCString(pctx, st);
+            JS_FreeValue(pctx, stack);
             JS_FreeCString(pctx, msg);
             JS_FreeValue(pctx, ex);
         }
@@ -10370,3 +12414,19 @@ void mini_bridge_unlock_pointer(MiniBridge *b)
         mini_event_dispatch(b->ev, &ev, b->doc->root);
     }
 }
+
+void mini_bridge_dispatch_resize(MiniBridge *b)
+{
+    if (!b || !b->ctx || b->in_dispatch_resize)
+        return;
+    b->in_dispatch_resize = 1;
+    const char *code =
+        "if (typeof window !== 'undefined') {"
+        "  var ev = new Event('resize');"
+        "  if (typeof window.dispatchEvent === 'function') { try { window.dispatchEvent(ev); } catch(e){} }"
+        "  if (typeof window.onresize === 'function') { try { window.onresize(ev); } catch(e){} }"
+        "}";
+    mini_bridge_eval(b, code, strlen(code), "<dispatch-resize>");
+    b->in_dispatch_resize = 0;
+}
+

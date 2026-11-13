@@ -14,12 +14,47 @@
 #define MINI_DOM_H
 
 #include <stdint.h>
+#include <string.h>
+
+#if defined(_WIN32) && !defined(strtok_r)
+#define strtok_r strtok_s
+#endif
+
 #include "mini_renderer.h"
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
+
+   /* ------------------------------------------------------------------ */
+   /* Parser Diagnostics (HTML/CSS precise line and column error tracking) */
+   /* ------------------------------------------------------------------ */
+   typedef enum
+   {
+      MINI_PARSE_SEV_INFO = 0,
+      MINI_PARSE_SEV_WARN = 1,
+      MINI_PARSE_SEV_ERROR = 2
+   } MiniParseSeverity;
+
+   typedef struct MiniParseDiagnostic
+   {
+      int line;
+      int col;
+      MiniParseSeverity severity;
+      char source[16];   /* "HTML" or "CSS" */
+      char rule[48];     /* e.g. "unexpected-character", "unknown-property", etc. */
+      char message[256]; /* detailed diagnostic message */
+      char snippet[512]; /* multi-line source snippet with caret pointing to column */
+   } MiniParseDiagnostic;
+
+   typedef void (*MiniParseDiagnosticCallback)(const MiniParseDiagnostic *diag, void *user_data);
+
+   /* Format a compiler-style multi-line diagnostic snippet with line numbers and a caret arrow */
+   void mini_format_diagnostic_snippet(const char *src, int line, int col,
+                                       const char *source_tag, MiniParseSeverity sev,
+                                       const char *rule, const char *msg,
+                                       char *out_buf, size_t out_cap);
 
    /* ------------------------------------------------------------------ */
    /* Node types (mirrors DOM NodeType numbers so JS === checks pass)    */
@@ -205,12 +240,16 @@ extern "C"
 
       /* Typography & Text */
       int font_weight;     /* 400=normal, 700=bold, 800/900 */
+      char font_family[64];
       int text_align;      /* 0=left, 1=center, 2=right, 3=justify */
       int text_decoration; /* 0=none, 1=underline, 2=line-through, 3=overline */
       int white_space;     /* 0=normal, 1=nowrap, 2=pre, 3=pre-wrap */
       int word_break;      /* 0=normal, 1=break-all, 2=keep-all */
       int text_overflow;   /* 0=clip, 1=ellipsis */
       int vertical_align;  /* 0=baseline 1=middle 2=top 3=bottom 4=sub 5=super */
+      uint8_t object_fit;  /* 0=fill, 1=contain, 2=cover, 3=none, 4=scale-down */
+      MiniLength object_pos_x, object_pos_y;
+      uint8_t touch_action;
 
       /* Background image */
       char bg_image_url[256];
@@ -312,6 +351,48 @@ extern "C"
       float clip_poly_pts[8][2];
       uint8_t has_clip_rect;
       float clip_rect[4]; /* top, right, bottom, left */
+
+      /* Aspect Ratio (aspect-ratio: W / H or ratio) */
+      float aspect_ratio_w, aspect_ratio_h;
+      uint8_t has_aspect_ratio;
+
+      /* Outline (outline: width style color, outline-offset) */
+      float outline_w;
+      uint8_t outline_style; /* 0=none 1=solid 2=dashed 3=dotted 4=double */
+      float outline_r, outline_g, outline_b, outline_a;
+      float outline_offset;
+      uint8_t has_outline;
+
+      /* Visibility & list-style */
+      uint8_t visibility;      /* 0=visible, 1=hidden, 2=collapse */
+      uint8_t visibility_set;
+      uint8_t list_style_type; /* 0=disc, 1=circle, 2=square, 3=decimal, 4=none */
+
+      /* Alignment extensions */
+      int justify_items; /* 0=legacy/stretch 1=start 2=end 3=center 4=baseline */
+      int justify_self;  /* -1=auto 0=stretch 1=start 2=end 3=center 4=baseline */
+
+      /* text-decoration extensions */
+      float text_decoration_color_r, text_decoration_color_g, text_decoration_color_b, text_decoration_color_a;
+      uint8_t has_text_decoration_color;
+      float text_decoration_thickness;
+      uint8_t text_decoration_style; /* 0=solid 1=double 2=dotted 3=dashed 4=wavy */
+
+      /* SVG presentation CSS properties */
+      char svg_fill[64];
+      uint8_t has_svg_fill;
+      char svg_stroke[64];
+      uint8_t has_svg_stroke;
+      float svg_fill_opacity;
+      uint8_t has_svg_fill_opacity;
+      float svg_stroke_opacity;
+      uint8_t has_svg_stroke_opacity;
+      float svg_stroke_width;
+      uint8_t has_svg_stroke_width;
+      float svg_stroke_dashoffset;
+      uint8_t has_svg_stroke_dashoffset;
+      char svg_stroke_dasharray[64];
+      uint8_t has_svg_stroke_dasharray;
    } MiniStyle;
 
    /* ------------------------------------------------------------------ */
@@ -466,6 +547,8 @@ extern "C"
       float scroll_y;
       float max_scroll_x;
       float max_scroll_y;
+      float scroll_target_y;
+      uint8_t is_smooth_scrolling;
       int viewport_w;
       int viewport_h;
       MiniArena doc_arena;
@@ -502,6 +585,15 @@ extern "C"
          on animation frames where the eased progress is unchanged (e.g. a
          steps(2) cursor blink holds the same value for ~33/34 frames). */
       uint8_t paint_dirty;
+      uint8_t restyle_dirty;
+      uint8_t needs_resize_event;
+
+      /* Diagnostics store for HTML/CSS parser line/col errors and warnings */
+#define MINI_MAX_DOC_DIAGNOSTICS 128
+      MiniParseDiagnostic diagnostics[MINI_MAX_DOC_DIAGNOSTICS];
+      int diagnostic_count;
+      MiniParseDiagnosticCallback diagnostic_cb;
+      void *diagnostic_ud;
    } MiniDocument;
 
    /* ------------------------------------------------------------------ */
@@ -509,6 +601,12 @@ extern "C"
    /* ------------------------------------------------------------------ */
    MiniDocument *mini_doc_create(void);
    void mini_doc_destroy(MiniDocument *doc);
+
+   /* Diagnostics API (HTML & CSS parser line/col errors & warnings) */
+   void mini_doc_add_diagnostic(MiniDocument *doc, const MiniParseDiagnostic *diag);
+   int mini_doc_get_diagnostics(MiniDocument *doc, MiniParseDiagnostic *out, int max_count);
+   void mini_doc_clear_diagnostics(MiniDocument *doc);
+   void mini_doc_set_diagnostic_handler(MiniDocument *doc, MiniParseDiagnosticCallback cb, void *user_data);
 
    /* Set/get the process-wide "active document" — the document whose
       MiniDocumentContext backs the file-scope g_* / g2d_* macros. The host
@@ -632,6 +730,8 @@ extern "C"
       Returns count of matches written into out[] (capped at max). */
    int mini_dom_query_selector_all(struct MiniDocument *doc, const char *selector,
                                    struct MiniNode **out, int max);
+   int mini_dom_node_query_selector_all(struct MiniNode *root, const char *selector,
+                                        struct MiniNode **out, int max);
    struct MiniNode *mini_dom_query_selector(struct MiniDocument *doc,
                                             const char *selector);
 
@@ -685,6 +785,7 @@ extern "C"
       inner=1 -> innerHTML (children only). Writes a null-terminated string. */
    void mini_dom_outer_html(const struct MiniNode *n, int inner,
                             char *out, size_t cap);
+   char *mini_dom_outer_html_alloc(const struct MiniNode *n, int inner, size_t *out_len);
 
    /* ---- Live DOM mutation events (for the Elements panel) -------------- */
    /* Called from append_child/remove_child/set_attribute when the tree is

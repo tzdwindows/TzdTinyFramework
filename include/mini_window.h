@@ -86,6 +86,10 @@ struct MiniWindow
     /* per-frame flags */
     uint8_t input_dirty;   /* set by GLFW callbacks; read by the idle gate */
     uint8_t closing;       /* set when the window is being closed */
+    uint8_t pending_move;  /* coalesced mouse move pending per-frame flush */
+    float   pending_mx;
+    float   pending_my;
+    int     pending_mmods;
 
     /* Lifetime refcount, mirroring the ChildProcess pattern: the window list
        holds one ref, the JS BrowserWindow wrapper holds one ref. The JS

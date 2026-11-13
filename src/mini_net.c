@@ -1442,6 +1442,27 @@ int mini_net_fetch(const char *method, const char *url,
                                  etag, lm, cc, exp);
         }
     }
+    /* Handle HTTP 301/302/303/307/308 redirects automatically */
+    if (out->resp_headers && (out->status == 301 || out->status == 302 || out->status == 303 ||
+                              out->status == 307 || out->status == 308))
+    {
+        char loc[1024];
+        if (header_value(out->resp_headers, "Location", loc, sizeof loc))
+        {
+            char next_url[1024];
+            if (!strncmp(loc, "http://", 7) || !strncmp(loc, "https://", 8))
+                snprintf(next_url, sizeof next_url, "%s", loc);
+            else if (loc[0] == '/')
+                snprintf(next_url, sizeof next_url, "%s://%s%s", o.scheme, o.host, loc);
+            else
+                snprintf(next_url, sizeof next_url, "%s/%s", eff_url, loc);
+            mini_logf(MINI_LOG_INFO, "net", "%d redirect: %s -> %s", out->status, eff_url, next_url);
+            mini_net_record_free(out);
+            memset(out, 0, sizeof(*out));
+            return mini_net_fetch(method, next_url, extra_headers, body, body_len, page_origin, out);
+        }
+    }
+
     return rc;
 }
 

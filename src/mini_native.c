@@ -30,6 +30,14 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#ifndef S_ISDIR
+#define S_ISDIR(mode) (((mode) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(mode) (((mode) & _S_IFMT) == _S_IFREG)
+#endif
+#endif
 #include <quickjs.h>
 #if defined(_WIN32)
 #  define GLFW_EXPOSE_NATIVE_WIN32

@@ -221,7 +221,7 @@ static void resolve_one_var_scoped(const char **pp, char **out, size_t *olen, si
     const char *val = get_var_scoped(look, node);
     const char *use = (val && val[0]) ? val : fallback;
     if (!use)
-        use = "0";
+        use = "";
     size_t ul = strlen(use);
     if (*olen + ul + 1 > *ocap)
     {
@@ -1328,13 +1328,28 @@ static int parse_shadow_components(const char *str, float *x, float *y, float *b
  * would lose its tilt between stops). Values are kept in source units
  * (deg / px) since the result is re-emitted as a string that mini_style_set
  * re-parses. */
+static int has_percent_unit(const char *s)
+{
+    if (!s)
+        return 0;
+    while (*s && *s != ')' && *s != ',')
+    {
+        if (*s == '%')
+            return 1;
+        s++;
+    }
+    return 0;
+}
+
 static void parse_transform_components(const char *str,
                                        float *tx, float *ty, float *tz,
+                                       int *tx_pct, int *ty_pct,
                                        float *sx, float *sy,
                                        float *rx, float *ry, float *rz,
                                        float *skx, float *sky, float *persp)
 {
     *tx = *ty = *tz = *rx = *ry = *rz = *skx = *sky = *persp = 0.0f;
+    *tx_pct = *ty_pct = 0;
     *sx = *sy = 1.0f;
     if (!str || !*str || !strcmp(str, "none"))
         return;
@@ -1348,10 +1363,12 @@ static void parse_transform_components(const char *str,
         if (!strncmp(p, "translateY(", 11))
         {
             *ty = (float)atof(p + 11);
+            *ty_pct = has_percent_unit(p + 11);
         }
         else if (!strncmp(p, "translateX(", 11))
         {
             *tx = (float)atof(p + 11);
+            *tx_pct = has_percent_unit(p + 11);
         }
         else if (!strncmp(p, "translateZ(", 11))
         {
@@ -1371,9 +1388,15 @@ static void parse_transform_components(const char *str,
             char *y_s = strtok_r(NULL, ",", &save);
             char *z_s = strtok_r(NULL, ",", &save);
             if (x_s)
+            {
                 *tx = (float)atof(x_s);
+                *tx_pct = has_percent_unit(x_s);
+            }
             if (y_s)
+            {
                 *ty = (float)atof(y_s);
+                *ty_pct = has_percent_unit(y_s);
+            }
             if (z_s)
                 *tz = (float)atof(z_s);
         }
@@ -1390,9 +1413,15 @@ static void parse_transform_components(const char *str,
             char *x_s = strtok_r(tmp, ",", &save);
             char *y_s = strtok_r(NULL, ",", &save);
             if (x_s)
+            {
                 *tx = (float)atof(x_s);
+                *tx_pct = has_percent_unit(x_s);
+            }
             if (y_s)
+            {
                 *ty = (float)atof(y_s);
+                *ty_pct = has_percent_unit(y_s);
+            }
         }
         else if (!strncmp(p, "perspective(", 12))
         {
@@ -1626,11 +1655,14 @@ void mini_css_interpolate_val(const char *prop, const char *v1, const char *v2, 
     {
         float tx1, ty1, tz1, sx1, sy1, rx1, ry1, rz1, skx1, sky1, pp1;
         float tx2, ty2, tz2, sx2, sy2, rx2, ry2, rz2, skx2, sky2, pp2;
-        parse_transform_components(v1, &tx1, &ty1, &tz1, &sx1, &sy1, &rx1, &ry1, &rz1, &skx1, &sky1, &pp1);
-        parse_transform_components(v2, &tx2, &ty2, &tz2, &sx2, &sy2, &rx2, &ry2, &rz2, &skx2, &sky2, &pp2);
+        int tx1_pct = 0, ty1_pct = 0, tx2_pct = 0, ty2_pct = 0;
+        parse_transform_components(v1, &tx1, &ty1, &tz1, &tx1_pct, &ty1_pct, &sx1, &sy1, &rx1, &ry1, &rz1, &skx1, &sky1, &pp1);
+        parse_transform_components(v2, &tx2, &ty2, &tz2, &tx2_pct, &ty2_pct, &sx2, &sy2, &rx2, &ry2, &rz2, &skx2, &sky2, &pp2);
         float tx = tx1 * (1.0f - t) + tx2 * t;
         float ty = ty1 * (1.0f - t) + ty2 * t;
         float tz = tz1 * (1.0f - t) + tz2 * t;
+        int use_tx_pct = (tx1_pct && tx2_pct) || (tx1_pct && tx2 == 0.0f) || (tx2_pct && tx1 == 0.0f);
+        int use_ty_pct = (ty1_pct && ty2_pct) || (ty1_pct && ty2 == 0.0f) || (ty2_pct && ty1 == 0.0f);
         float sx = sx1 * (1.0f - t) + sx2 * t;
         float sy = sy1 * (1.0f - t) + sy2 * t;
         float rx = rx1 * (1.0f - t) + rx2 * t;
@@ -1663,7 +1695,17 @@ void mini_css_interpolate_val(const char *prop, const char *v1, const char *v2, 
         }
         if (tx != 0.0f || ty != 0.0f)
         {
-            bi += (size_t)snprintf(buf + bi, sizeof(buf) - bi, "translate(%.4gpx, %.4gpx) ", tx, ty);
+            if (use_tx_pct || use_ty_pct)
+            {
+                if (tx != 0.0f)
+                    bi += (size_t)snprintf(buf + bi, sizeof(buf) - bi, use_tx_pct ? "translateX(%.4g%%) " : "translateX(%.4gpx) ", tx);
+                if (ty != 0.0f)
+                    bi += (size_t)snprintf(buf + bi, sizeof(buf) - bi, use_ty_pct ? "translateY(%.4g%%) " : "translateY(%.4gpx) ", ty);
+            }
+            else
+            {
+                bi += (size_t)snprintf(buf + bi, sizeof(buf) - bi, "translate(%.4gpx, %.4gpx) ", tx, ty);
+            }
         }
         if (sx != 1.0f || sy != 1.0f)
         {

@@ -13,13 +13,19 @@ function Resolve-ToolPath ($cmdName, $defaultPath) {
 }
 
 $GCC_PATH = Resolve-ToolPath "gcc" "C:\msys64\mingw64\bin\gcc.exe"
-$CLANG_PATH = Resolve-ToolPath "clang" "C:\Program Files\LLVM\bin\clang.exe"
+$CLANG_PATH = Resolve-ToolPath "clang" "E:\LLVM_SDK\bin\clang.exe"
+if (-not $CLANG_PATH) {
+    $CLANG_PATH = Resolve-ToolPath "clang" "C:\Program Files\LLVM\bin\clang.exe"
+}
 $OBJCOPY_PATH = Resolve-ToolPath "objcopy" "C:\msys64\mingw64\bin\objcopy.exe"
 $AR_PATH = Resolve-ToolPath "ar" "C:\msys64\mingw64\bin\ar.exe"
+if (-not $AR_PATH) {
+    $AR_PATH = Resolve-ToolPath "llvm-ar" "E:\LLVM_SDK\bin\llvm-ar.exe"
+}
 
-$GCC = if ($GCC_PATH) { $GCC_PATH } else { "gcc" }
-$CLANG = if ($CLANG_PATH) { $CLANG_PATH } else { $GCC }
-$AR = if ($AR_PATH) { $AR_PATH } else { "ar" }
+$CLANG = if ($CLANG_PATH) { $CLANG_PATH } else { "clang" }
+$GCC = if ($GCC_PATH) { $GCC_PATH } else { $CLANG }
+$AR = if ($AR_PATH) { $AR_PATH } else { "llvm-ar" }
 $OUTPUT = "build\tiny_app.exe"
 
 # 2. Compiler & Linker Flags
@@ -47,13 +53,15 @@ $INCLUDES = @(
     "-Ilibs\quickjs",
     "-Ilibs\stb",
     "-Ilibs\mbedtls\include",
-    "-ID:\glfw-3.4.bin.WIN64\include"
+    "-ID:\glfw-3.4.bin.WIN64\include",
+    "-ID:\vulkan\Include"
 )
 
 # 4. Source Files (Application Sources)
 $SOURCES = @(
     "src\main.c",
     "src\mini_renderer.c",
+    "src\mini_vulkan.c",
     "src\mini_gradient.c",
     "src\mini_css.c",
     "src\mini_dom.c",
@@ -97,6 +105,8 @@ $LIBS = @(
     "-lmbedtls",
     "-LD:\glfw-3.4.bin.WIN64\lib-mingw-w64",
     "-lglfw3dll",
+    "-LD:\vulkan\Lib",
+    "-lvulkan-1",
     "-lopengl32",
     "-lgdi32",
     "-luser32",

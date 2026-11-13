@@ -14,6 +14,25 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+
+#if defined(_WIN32)
+  #if !defined(strtok_r)
+    #define strtok_r strtok_s
+  #endif
+  #if !defined(strcasecmp)
+    #define strcasecmp _stricmp
+  #endif
+  #if !defined(strncasecmp)
+    #define strncasecmp _strnicmp
+  #endif
+  #ifndef WINGDIAPI
+    #define WINGDIAPI __declspec(dllimport)
+  #endif
+  #ifndef APIENTRY
+    #define APIENTRY __stdcall
+  #endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {

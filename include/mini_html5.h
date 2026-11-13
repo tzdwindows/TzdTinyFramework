@@ -43,6 +43,10 @@ extern "C" {
 #endif
 
 struct MiniDocument;
+struct MiniNode;
+struct MiniParseDiagnostic;
+
+typedef void (*MiniHtml5DiagCallback)(const struct MiniParseDiagnostic *diag, void *user_data);
 
 /* Opaque parser state (tokenizer + open-elements stack + AFE list + mode). */
 typedef struct MiniHtml5Parser MiniHtml5Parser;
@@ -66,9 +70,16 @@ int mini_html5_finish(MiniHtml5Parser *p);
 /* Release parser state (not the document tree). */
 void mini_html5_destroy(MiniHtml5Parser *p);
 
+/* Attach a diagnostic callback for HTML syntax error tracking with line/col. */
+void mini_html5_set_diagnostic_handler(MiniHtml5Parser *p, MiniHtml5DiagCallback cb, void *user_data);
+
 /* Convenience one-shot: feed the whole string + finish. Replaces the legacy
    mini_dom_parse_html contract (appends to doc->body). */
 void mini_html5_parse(struct MiniDocument *doc, const char *html);
+
+/* Parse an HTML fragment in the context of `context_parent` and append the
+   parsed children directly into `context_parent` (for innerHTML / insertAdjacentHTML). */
+void mini_html5_parse_fragment(struct MiniDocument *doc, struct MiniNode *context_parent, const char *html);
 
 /* Self-test: parses a battery of malformed/edge-case documents and asserts
    the resulting tree shape (AAA, foster-parenting, auto-close). Returns 0

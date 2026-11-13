@@ -34,6 +34,20 @@
 #include <GLFW/glfw3.h>
 #endif
 
+static void dump_nodes_rec(struct MiniNode *n, const char *prefix)
+{
+    if (!n) return;
+    const char *tag = n->tag ? n->tag : "";
+    const char *href = mini_node_get_attribute(n, "href");
+    if (href || !strcmp(tag, "button"))
+    {
+        mini_logf(MINI_LOG_INFO, "test", "TINY_EXACT_NODE: %s <%s href='%s'>: w=%.1f, h=%.1f, x=%.1f, y=%.1f, pad=[%.1f, %.1f, %.1f, %.1f]",
+                  prefix, tag, href ? href : "", n->style.w, n->style.h, n->style.abs_x, n->style.abs_y,
+                  n->style.padding[0], n->style.padding[1], n->style.padding[2], n->style.padding[3]);
+    }
+    for (struct MiniNode *c = n->first_child; c; c = c->next_sibling)
+        dump_nodes_rec(c, prefix);
+}
 /* Win32 IMM (Input Method Manager) so the IME candidate window tracks the
    text caret instead of clinging to the window corner. glfwGetWin32Window
    needs the native header behind GLFW_EXPOSE_NATIVE_WIN32. */
@@ -571,16 +585,20 @@ static void update_cursor_icon(GLFWwindow *win, MiniWindow *mw, float fx, float 
     glfwSetCursor(win, g_cursor_arrow);
 }
 
-static void glfw_cursor_cb(GLFWwindow *win, double x, double y)
+static void flush_pending_move(MiniWindow *mw)
 {
-    MiniWindow *mw = (MiniWindow *)glfwGetWindowUserPointer(win);
-    if (!mw) return;
+    if (!mw || !mw->pending_move)
+        return;
+    mw->pending_move = 0;
+    float fx = mw->pending_mx;
+    float fy = mw->pending_my;
+    int mods = mw->pending_mmods;
+    GLFWwindow *win = (GLFWwindow *)mw->win;
     MiniApp *app = mw->app;
-    MiniCDP *cdp = mw->is_primary ? app->cdp : NULL;
-    float fx, fy;
-    glfw_win_to_fb(win, x, y, &fx, &fy);
+    MiniCDP *cdp = (mw->is_primary && app) ? app->cdp : NULL;
 
-    update_cursor_icon(win, mw, fx, fy);
+    if (win)
+        update_cursor_icon(win, mw, fx, fy);
 
     if (cdp && mini_cdp_is_inspect_mode(cdp) && mw->doc)
     {
@@ -596,8 +614,21 @@ static void glfw_cursor_cb(GLFWwindow *win, double x, double y)
     if (mw->events)
     {
         g_input_dirty = 1; /* hover tracking needs a fresh frame */
-        mini_events_handle_mouse_move(mw->events, fx, fy, g_mods);
+        mini_events_handle_mouse_move(mw->events, fx, fy, mods);
     }
+}
+
+static void glfw_cursor_cb(GLFWwindow *win, double x, double y)
+{
+    MiniWindow *mw = (MiniWindow *)glfwGetWindowUserPointer(win);
+    if (!mw) return;
+    float fx, fy;
+    glfw_win_to_fb(win, x, y, &fx, &fy);
+    mw->pending_move = 1;
+    mw->pending_mx = fx;
+    mw->pending_my = fy;
+    mw->pending_mmods = g_mods;
+    g_input_dirty = 1;
 }
 
 static void glfw_mouse_cb(GLFWwindow *win, int button, int action, int mods)
@@ -629,6 +660,7 @@ static void glfw_mouse_cb(GLFWwindow *win, int button, int action, int mods)
 
     if (mw->events)
     {
+        flush_pending_move(mw);
         g_input_dirty = 1; /* click/press may change :active/:focus */
         mini_events_handle_mouse_button(mw->events, button, action, fx, fy, mods);
     }
@@ -639,6 +671,7 @@ static void glfw_scroll_cb(GLFWwindow *win, double dx, double dy)
     MiniWindow *mw = (MiniWindow *)glfwGetWindowUserPointer(win);
     if (!mw || !mw->events)
         return;
+    flush_pending_move(mw);
     double x, y;
     glfwGetCursorPos(win, &x, &y);
     g_input_dirty = 1; /* wheel scrolls the page */
@@ -835,6 +868,8 @@ MiniResult mini_app_create(const MiniWindowConfig *cfg, MiniApp **out)
         free(app);
         return MINI_ERR_INIT;
     }
+    app->doc->viewport_w = app->r->gpu.width;
+    app->doc->viewport_h = app->r->gpu.height;
 
     /* 3) QuickJS + DOM/BOM/WebGL polyfill bridge */
     app->bridge = mini_bridge_create(app->r, app->doc);
@@ -908,6 +943,16 @@ MiniResult mini_app_load(MiniApp *app, const char *entry)
         rc = mini_bridge_eval(app->bridge, src, len, entry);
     free(src);
     app->loaded = (rc == 0);
+    if (app->doc)
+    {
+        struct MiniNode *cc = mini_dom_get_element_by_id(app->doc, "canvas-container");
+        struct MiniNode *sb = mini_dom_get_element_by_id(app->doc, "speech-bubble");
+        struct MiniNode *rcard = mini_dom_get_element_by_id(app->doc, "ref-card");
+        mini_logf(MINI_LOG_INFO, "test", "KEMONO_DOM_CHECK: canvas_container=%p, speech_bubble=%p, ref_card=%p",
+                  (void*)cc, (void*)sb, (void*)rcard);
+        app->doc->restyle_dirty = 1;
+        app->doc->layout_dirty = 1;
+    }
 
     if (app->cdp)
     {
@@ -1007,13 +1052,22 @@ MiniResult mini_app_run(MiniApp *app)
 
     while (!glfwWindowShouldClose(win))
     {
+        mini_dom_set_active_doc(app->doc);
+        mini_bridge_set_active(app->bridge);
         glfwPollEvents();
-
-        /* The primary is the active window at the top of each iteration: switch
-           the process-wide active doc/bridge to the primary so the primary
-           viewport/tick/pump/render phases below operate on the primary's
-           document. (Secondary windows switch these per-window during their
-           own render phase, then restore the primary here next iteration.) */
+        {
+            int nwin = 0;
+            MiniWindow **wins = mini_app_windows(app, &nwin);
+            for (int i = 0; i < nwin; i++)
+            {
+                if (wins[i] && wins[i]->pending_move)
+                {
+                    mini_dom_set_active_doc(wins[i]->doc);
+                    mini_bridge_set_active(wins[i]->bridge);
+                    flush_pending_move(wins[i]);
+                }
+            }
+        }
         mini_dom_set_active_doc(app->doc);
         mini_bridge_set_active(app->bridge);
 
@@ -1046,23 +1100,47 @@ MiniResult mini_app_run(MiniApp *app)
             app->r->gpu.height = fh;
             app->r->vbuf.width = fw;
             app->r->vbuf.height = fh;
-            if (app->events)
-                mini_events_handle_resize(app->events, fw, fh);
-            else if (app->doc)
+            if (app->doc)
             {
                 app->doc->viewport_w = fw;
                 app->doc->viewport_h = fh;
                 app->doc->dirty = 1;
                 app->doc->layout_dirty = 1;
             }
+            if (app->events)
+                mini_events_handle_resize(app->events, fw, fh);
+        }
+
+        /* Test simulation events: inject right after polling so input events are handled immediately */
+        if (getenv("TINY_TEST_CONTEXT_MENU") && g_frames == 80 && app->events)
+        {
+            mini_events_handle_mouse_move(app->events, 300.0f, 300.0f, 0);
+            mini_events_handle_mouse_button(app->events, 1, 1, 300.0f, 300.0f, 0);
+            mini_events_handle_mouse_button(app->events, 1, 0, 300.0f, 300.0f, 0);
+        }
+        if (getenv("TINY_TEST_NAV_CLICK") && g_frames == 5 && app->events)
+        {
+            float click_x = (float)atof(getenv("TINY_TEST_NAV_CLICK"));
+            if (click_x <= 0.0f) click_x = 760.0f;
+            mini_logf(MINI_LOG_INFO, "test", "Simulating nav click at (%.1f, 32.0)", click_x);
+            mini_events_handle_mouse_move(app->events, click_x, 32.0f, 0);
+            mini_events_handle_mouse_button(app->events, 0, 1, click_x, 32.0f, 0);
+            mini_events_handle_mouse_button(app->events, 0, 0, click_x, 32.0f, 0);
+        }
+        /* 0-Latency Pipeline: Immediately restyle DOM upon input events BEFORE tick_frame,
+           so new transitions step on this very frame and present on the next vsync interval! */
+        int did_restyle = 0;
+        if (app->doc && (app->doc->restyle_dirty || viewport_changed))
+        {
+            mini_dom_restyle(app->doc);
+            app->doc->restyle_dirty = 0;
+            did_restyle = 1;
         }
 
         double now = glfwGetTime();
         double dt = now - last_time;
-        if (dt < 0.0)
-            dt = 0.0;
-        else if (dt > 0.25)
-            dt = 0.25; /* clamp after a stall (debugger / suspend) */
+        if (dt <= 0.0 || dt > 0.05)
+            dt = 1.0 / 60.0; /* Reset frame delta upon wakeup from sleep or stall for butter-smooth 60fps transitions */
         last_time = now;
 
         /* Advance CSS transitions / @keyframes for the elapsed wall-clock dt */
@@ -1110,6 +1188,9 @@ MiniResult mini_app_run(MiniApp *app)
         int need_frame = g_input_dirty || viewport_changed ||
                          mini_bridge_pending_raf(app->bridge) > 0 ||
                          app->doc->dirty || app->doc->active_effects ||
+                         app->doc->is_smooth_scrolling ||
+                         app->doc->layout_dirty || app->doc->paint_dirty ||
+                         app->doc->restyle_dirty ||
                          emu_active || /* an active CDP metrics override */
                          (g_frame_cap && g_frames < g_frame_cap) ||
                          mini_events_has_text_focus(app->events) ||
@@ -1125,6 +1206,7 @@ MiniResult mini_app_run(MiniApp *app)
             glfwWaitEventsTimeout(target_frame);
             if (app->cdp)
                 mini_cdp_poll(app->cdp);
+            last_time = glfwGetTime(); /* Immediately refresh last_time so the next active frame doesn't suffer a dt spike */
             continue;
         }
 
@@ -1132,27 +1214,56 @@ MiniResult mini_app_run(MiniApp *app)
             mini_diag_begin_frame(app->diag);
         double t = app->diag ? mini_diag_mark(app->diag) : 0;
 
-        if (app->doc->dirty || g_input_dirty || viewport_changed)
+        if (getenv("TINY_SCROLL_Y") && app->doc)
+        {
+            float target_sy = (float)atof(getenv("TINY_SCROLL_Y"));
+            if (app->doc->scroll_y != target_sy)
+            {
+                app->doc->scroll_y = target_sy;
+                app->doc->scroll_target_y = target_sy;
+                app->doc->is_smooth_scrolling = 0;
+                app->doc->layout_dirty = 1;
+                app->doc->dirty = 1;
+                app->doc->paint_dirty = 1;
+            }
+        }
+        double t0 = glfwGetTime();
+        int did_layout = 0;
+        if (app->doc->restyle_dirty)
         {
             mini_dom_restyle(app->doc);
+            app->doc->restyle_dirty = 0;
+            did_restyle = 1;
         }
+        double t1 = glfwGetTime();
         g_input_dirty = 0;
 
         /* layout: read (possibly mutated) DOM, write geometry.
-           Gated on doc->dirty (restyle/mutation) OR doc->layout_dirty
-           (a layout-affecting style change). Pure paint-only animation
+           Gated on (doc->layout_dirty || did_restyle). Pure paint-only animation
            frames (opacity blink, transform, background pulse) skip this
            entirely — previously layout ran every frame unconditionally,
            re-parsing grid templates and double-laying children at 60 Hz. */
-        if (app->doc->dirty || app->doc->layout_dirty)
+        if (app->doc->layout_dirty || did_restyle)
+        {
             mini_layout_run(app->doc, fw, fh);
+            app->doc->layout_dirty = 0;
+            did_layout = 1;
+        }
+        if ((viewport_changed || app->doc->needs_resize_event) && app->bridge)
+        {
+            app->doc->needs_resize_event = 0;
+            mini_bridge_dispatch_resize(app->bridge);
+        }
+        double t2 = glfwGetTime();
         if (app->diag)
             mini_diag_section(app->diag, &t, MINI_DIAG_LAYOUT);
 
+#if MINI_USE_OPENGL
         /* 1. Clear background & render page backdrop (solid, gradient, image) */
         mini_renderer_begin_frame(app->r);
         mini_dom_render_page_backdrop(app->doc, app->r, (float)fw, (float)fh);
         mini_renderer_flush(app->r);
+        double t3 = glfwGetTime();
 
         /* 2. JS frame (rAF): WebGL/Three.js draws into canvas region */
         mini_renderer_restore_webgl(app->r);
@@ -1165,6 +1276,38 @@ MiniResult mini_app_run(MiniApp *app)
         mini_dom_set_render_events(app->events);
         mini_dom_render_into(app->doc->body, app->r);
         mini_renderer_flush(app->r);
+#else
+        /* Vulkan single-pass pipeline: run rAF first, then record backdrop + DOM in a single render pass */
+        mini_renderer_restore_webgl(app->r);
+        mini_bridge_fire_raf(app->bridge, now * 1000.0);
+        if (app->doc->restyle_dirty)
+        {
+            mini_dom_restyle(app->doc);
+            app->doc->restyle_dirty = 0;
+            app->doc->layout_dirty = 1;
+        }
+        if (app->doc->layout_dirty)
+        {
+            mini_layout_run(app->doc, fw, fh);
+            app->doc->layout_dirty = 0;
+            did_layout = 1;
+        }
+        if ((viewport_changed || app->doc->needs_resize_event) && app->bridge)
+        {
+            app->doc->needs_resize_event = 0;
+            mini_bridge_dispatch_resize(app->bridge);
+        }
+        if (app->diag)
+            mini_diag_section(app->diag, &t, MINI_DIAG_RAF);
+        double t3 = glfwGetTime();
+
+        mini_renderer_begin_frame(app->r);
+        mini_dom_render_page_backdrop(app->doc, app->r, (float)fw, (float)fh);
+        mini_dom_set_render_events(app->events);
+        mini_dom_render_into(app->doc->body, app->r);
+        mini_renderer_flush(app->r);
+#endif
+        double t4 = glfwGetTime();
         if (app->diag)
             mini_diag_section(app->diag, &t, MINI_DIAG_DRAW);
 
@@ -1299,7 +1442,8 @@ MiniResult mini_app_run(MiniApp *app)
                     continue;
                 mini_window_render_frame(mw, now * 1000.0, dt);
             }
-            glfwMakeContextCurrent(win);
+            if (app->r && !app->r->gpu.is_vulkan)
+                glfwMakeContextCurrent(win);
             mini_dom_set_active_doc(app->doc);
             mini_bridge_set_active(app->bridge);
         }
@@ -1316,13 +1460,43 @@ MiniResult mini_app_run(MiniApp *app)
 
         if (g_frame_cap && ++g_frames >= g_frame_cap)
         {
+            if (getenv("TINY_DUMP_RECTS") && app->doc)
+            {
+                struct MiniNode *sbtn = mini_dom_get_element_by_id(app->doc, "submitBtn");
+                if (sbtn)
+                    mini_logf(MINI_LOG_INFO, "test", "TINY_EXACT: submitBtn: w=%.1f, h=%.1f, x=%.1f, y=%.1f", sbtn->style.w, sbtn->style.h, sbtn->style.abs_x, sbtn->style.abs_y);
+                struct MiniNode *inp_name = mini_dom_get_element_by_id(app->doc, "name");
+                if (inp_name)
+                    mini_logf(MINI_LOG_INFO, "test", "TINY_EXACT: name_input: w=%.1f, h=%.1f, x=%.1f, y=%.1f, focus=%d, sh_a=%.2f, has_sh=%d",
+                              inp_name->style.w, inp_name->style.h, inp_name->style.abs_x, inp_name->style.abs_y,
+                              inp_name->state_focused, inp_name->style.shadow_a, inp_name->style.has_shadow);
+                struct MiniNode *inp_email = mini_dom_get_element_by_id(app->doc, "email");
+                if (inp_email)
+                    mini_logf(MINI_LOG_INFO, "test", "TINY_EXACT: email_input: w=%.1f, h=%.1f, x=%.1f, y=%.1f, focus=%d, sh_a=%.2f, has_sh=%d",
+                              inp_email->style.w, inp_email->style.h, inp_email->style.abs_x, inp_email->style.abs_y,
+                              inp_email->state_focused, inp_email->style.shadow_a, inp_email->style.has_shadow);
+                struct MiniNode *hero = mini_dom_get_element_by_id(app->doc, "hero");
+                if (hero)
+                {
+                    mini_logf(MINI_LOG_INFO, "test", "TINY_EXACT: hero: w=%.1f, h=%.1f, x=%.1f, y=%.1f", hero->style.w, hero->style.h, hero->style.abs_x, hero->style.abs_y);
+                    dump_nodes_rec(hero, "hero");
+                }
+                struct MiniNode *feat = mini_dom_get_element_by_id(app->doc, "features");
+                if (feat)
+                    mini_logf(MINI_LOG_INFO, "test", "TINY_EXACT: features: w=%.1f, h=%.1f, x=%.1f, y=%.1f", feat->style.w, feat->style.h, feat->style.abs_x, feat->style.abs_y);
+                struct MiniNode *cont = mini_dom_get_element_by_id(app->doc, "contact");
+                if (cont)
+                    mini_logf(MINI_LOG_INFO, "test", "TINY_EXACT: contact: w=%.1f, h=%.1f, x=%.1f, y=%.1f", cont->style.w, cont->style.h, cont->style.abs_x, cont->style.abs_y);
+            }
+
             /* debug: dump a screenshot before exiting so we can see what
                actually rendered (the diag counters are unreliable).       */
             uint8_t *png = NULL;
             size_t plen = 0;
             if (mini_renderer_screenshot_png(app->r, &png, &plen) == 0 && png)
             {
-                FILE *sf = fopen("build/shot.png", "wb");
+                const char *shot_file = getenv("TINY_SHOT_FILE");
+                FILE *sf = fopen(shot_file ? shot_file : "build/shot.png", "wb");
                 if (sf)
                 {
                     fwrite(png, 1, plen, sf);
@@ -1341,7 +1515,7 @@ MiniResult mini_app_run(MiniApp *app)
                     if (!mw || mw->is_primary || mw->closing || !mw->r)
                         continue;
                     /* switch to this window's GL context to read its framebuffer */
-                    if (mw->win)
+                    if (mw->win && (!mw->r || !mw->r->gpu.is_vulkan))
                         glfwMakeContextCurrent((GLFWwindow *)mw->win);
                     mini_dom_set_active_doc(mw->doc);
                     uint8_t *sp = NULL; size_t sl = 0;
@@ -1354,7 +1528,8 @@ MiniResult mini_app_run(MiniApp *app)
                         free(sp);
                     }
                 }
-                glfwMakeContextCurrent(win);
+                if (app->r && !app->r->gpu.is_vulkan)
+                    glfwMakeContextCurrent(win);
             }
             glfwSetWindowShouldClose(win, GLFW_TRUE);
             break;
@@ -1578,12 +1753,16 @@ int main(int argc, char **argv)
        a modal "Assertion failed!" dialog that hangs the process.) */
 #if defined(_WIN32)
     _set_error_mode(_OUT_TO_STDERR);
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+    }
 #endif
     mini_log_init();
     mini_crash_set_version("1.0.0");
     mini_crash_init("tiny_app", "build");
-    if (!getenv("TINY_LOG_FILE"))
-        mini_log_set_file("build/tiny_app.log");
+    const char *lf = getenv("TINY_LOG_FILE");
+    mini_log_set_file(lf && lf[0] ? lf : "build/tiny_app.log");
     mini_logf(MINI_LOG_INFO, "app", "TinyFramework starting (mode=%s)",
               mini_app_mode() ? "CUSTOM_MINI" : "NATIVE");
 

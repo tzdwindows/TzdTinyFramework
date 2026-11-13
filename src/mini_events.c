@@ -295,15 +295,16 @@ static int collect_children_zdesc(struct MiniNode *n,
 
 /* recursive hit test carrying an accumulated clip rect (for overflow). */
 static struct MiniNode *hit_rec(struct MiniNode *n, float x, float y, float sx, float sy,
-                                float cx0, float cy0, float cx1, float cy1)
+                                float cx0, float cy0, float cx1, float cy1, int parent_fixed)
 {
     if (!n)
         return NULL;
     if (n->style.display == MINI_DISPLAY_NONE)
         return NULL; /* subtree not painted */
 
-    float test_x = (n->style.position == 3 || n->style.position == 4) ? x : (x + sx);
-    float test_y = (n->style.position == 3 || n->style.position == 4) ? y : (y + sy);
+    int is_fixed = parent_fixed || (n->style.position == 3 || n->style.position == 4);
+    float test_x = is_fixed ? x : (x + sx);
+    float test_y = is_fixed ? y : (y + sy);
 
     /* child clip: an overflow:clip parent restricts its children to its box */
     float nx0 = cx0, ny0 = cy0, nx1 = cx1, ny1 = cy1;
@@ -330,9 +331,12 @@ static struct MiniNode *hit_rec(struct MiniNode *n, float x, float y, float sx, 
     {
         struct MiniNode *c = arr[i];
         /* a child is only hittable where its ancestor clip permits */
-        if (test_x < nx0 || test_x > nx1 || test_y < ny0 || test_y > ny1)
-            break; /* the clip is uniform for all siblings here */
-        struct MiniNode *h = hit_rec(c, x, y, sx, sy, nx0, ny0, nx1, ny1);
+        int child_fixed = is_fixed || (c->style.position == 3 || c->style.position == 4);
+        float c_test_x = child_fixed ? x : (x + sx);
+        float c_test_y = child_fixed ? y : (y + sy);
+        if (c_test_x < nx0 || c_test_x > nx1 || c_test_y < ny0 || c_test_y > ny1)
+            continue;
+        struct MiniNode *h = hit_rec(c, x, y, sx, sy, nx0, ny0, nx1, ny1, is_fixed);
         if (h)
             return h;
     }
@@ -355,14 +359,14 @@ struct MiniNode *mini_dom_hit_test(struct MiniNode *root, float x, float y)
 {
     if (!root)
         return NULL;
-    return hit_rec(root, x, y, 0.0f, 0.0f, -1e9f, -1e9f, 1e9f, 1e9f);
+    return hit_rec(root, x, y, 0.0f, 0.0f, -1e9f, -1e9f, 1e9f, 1e9f, 0);
 }
 
 struct MiniNode *mini_dom_hit_test_doc(struct MiniDocument *doc, float x, float y)
 {
     if (!doc || !doc->body)
         return NULL;
-    return hit_rec(doc->body, x, y, doc->scroll_x, doc->scroll_y, -1e9f, -1e9f, 1e9f, 1e9f);
+    return hit_rec(doc->body, x, y, doc->scroll_x, doc->scroll_y, -1e9f, -1e9f, 1e9f, 1e9f, 0);
 }
 
 void mini_events_set_inline_handler(MiniEventState *st, MiniInlineEventHandlerCb cb, void *ud)
@@ -477,7 +481,10 @@ void mini_event_dispatch(MiniEventState *st, MiniEvent *ev, struct MiniNode *tar
 void mini_events_restyle(MiniEventState *st)
 {
     if (st && st->doc)
-        mini_dom_restyle(st->doc);
+    {
+        st->doc->restyle_dirty = 1;
+        st->doc->dirty = 1;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -723,13 +730,13 @@ static void caret_pos(struct MiniNode *n, float *out_x, float *out_y,
 {
     const MiniStyle *s = &n->style;
     int is_ta = !strcmp(n->tag, "textarea");
-    /* render_input draws text at fs=12 starting at x+5; textarea at x+4,y+4.
-       Honour font-size when set so caret aligns with custom-sized text. */
     float fs = s->font_size > 0 ? s->font_size : 12.0f;
     float ls = s->letter_set ? s->len_letter.v : 0.0f;
-    float line_h = fs + 4.0f; /* approximate line box for textarea */
-    float x0 = s->abs_x + (is_ta ? 4.0f : 5.0f);
-    float y0 = s->abs_y + (is_ta ? 4.0f : (s->h > fs ? (s->h - fs) * 0.5f : 0.0f));
+    float line_h = mini_text_line_height(fs);
+    float pad_l = (s->padding[3] > 0.0f) ? s->padding[3] : (is_ta ? 4.0f : 5.0f);
+    float pad_t = (s->padding[0] > 0.0f) ? s->padding[0] : 4.0f;
+    float x0 = s->abs_x + pad_l;
+    float y0 = s->abs_y + (is_ta ? pad_t : (s->h > fs ? (s->h - fs) * 0.5f : 0.0f));
 
     const char *val = control_value_get(n);
     int off = caret_clamp(val, n->caret_offset);
@@ -821,50 +828,68 @@ static int offset_from_x(const char *s, float x_rel, float fs, float ls)
    vertical extent contains the click, choosing the inline run whose x-range
    is nearest. Text-node geometry (abs_x/abs_y/w/h) is written by layout at
    mini_dom.c:4587-4643.                                                          */
+static int is_all_ws_str(const char *s);
+
 static struct MiniNode *text_node_under_rec(struct MiniNode *n, float x, float y,
                                             struct MiniNode *best,
                                             float *best_dist)
 {
-    if (!n)
+    if (!n || n->style.display == MINI_DISPLAY_NONE)
         return best;
-    if (n->type == MN_TEXT_NODE && n->text && n->text[0])
+    if (n->type == MN_TEXT_NODE && n->text && n->text[0] && !is_all_ws_str(n->text))
     {
+        float x0 = n->style.abs_x;
         float y0 = n->style.abs_y;
-        float h = n->style.h > 0 ? n->style.h : mini_text_line_height(n->style.font_size > 0 ? n->style.font_size : 16.0f);
-        if (y >= y0 && y <= y0 + h)
+        float w = n->style.w;
+        float h = n->style.h;
+        if ((x0 == 0.0f && y0 == 0.0f) || w <= 0.0f || h <= 0.0f)
         {
-            float x0 = n->style.abs_x;
-            float w = n->style.w > 0 ? n->style.w : 1e9f;
-            if (x >= x0 && x <= x0 + w)
+            char buf[256];
+            float fs, ls, lh, dx, dy, ww;
+            int align;
+            if (mini_dom_text_layout(n, buf, sizeof buf, &fs, &ls, &lh, &dx, &dy, &ww, &align) > 0)
             {
-                /* on this run and within x-range: best possible */
-                return n;
+                if (x0 == 0.0f && y0 == 0.0f) { x0 = dx; y0 = dy; }
+                if (w <= 0.0f) w = ww < 1000.0f ? ww : mini_text_measure_ex(buf, fs, ls);
+                if (h <= 0.0f) h = lh > 0.0f ? lh : mini_text_line_height(fs);
             }
-            /* right run on the line but click x is off to one side: track
-               nearest so we still pick the run the user likely meant. */
-            float d;
-            if (x < x0)
-                d = x0 - x;
-            else
-                d = x - (x0 + w);
-            if (!best || d < *best_dist)
-            {
-                best = n;
-                *best_dist = d;
-            }
+        }
+        if (h <= 0.0f)
+            h = mini_text_line_height(n->style.font_size > 0 ? n->style.font_size : 16.0f);
+        if (w <= 0.0f)
+            w = 1e9f;
+        float dx = (x < x0) ? (x0 - x) : (x > x0 + w ? x - (x0 + w) : 0.0f);
+        float dy = (y < y0) ? (y0 - y) : (y > y0 + h ? y - (y0 + h) : 0.0f);
+        if (dx == 0.0f && dy == 0.0f)
+        {
+            *best_dist = 0.0f;
+            return n;
+        }
+        float d = dx + dy * 4.0f;
+        if (!best || d < *best_dist)
+        {
+            best = n;
+            *best_dist = d;
         }
     }
     for (struct MiniNode *c = n->first_child; c; c = c->next_sibling)
+    {
         best = text_node_under_rec(c, x, y, best, best_dist);
+        if (*best_dist == 0.0f)
+            return best;
+    }
     return best;
 }
 
-static struct MiniNode *text_node_under(struct MiniNode *el, float x, float y)
+static struct MiniNode *text_node_under(struct MiniNode *el, float x, float y, float *out_dist)
 {
     if (!el)
         return NULL;
     float d = 1e9f;
-    return text_node_under_rec(el, x, y, NULL, &d);
+    struct MiniNode *res = text_node_under_rec(el, x, y, NULL, &d);
+    if (out_dist)
+        *out_dist = d;
+    return res;
 }
 
 /* Map a click (x,y) to a byte offset within the text node's COLLAPSED src
@@ -935,8 +960,15 @@ static void selection_begin(MiniEventState *st, struct MiniNode *t,
                             float x, float y)
 {
     selection_clear(st);
-    struct MiniNode *tn = text_node_under(t, x, y);
-    if (!tn)
+    float dist = 1e9f;
+    struct MiniNode *tn = text_node_under(t, x, y, &dist);
+    if ((!tn || dist > 24.0f) && st->doc && st->doc->body && t != st->doc->body)
+    {
+        float dist2 = 1e9f;
+        struct MiniNode *tn2 = text_node_under(st->doc->body, x, y, &dist2);
+        if (tn2 && dist2 <= 24.0f) { tn = tn2; dist = dist2; }
+    }
+    if (!tn || dist > 24.0f)
         return;
     int off = text_offset_at(tn, x, y);
     if (off < 0)
@@ -955,7 +987,15 @@ static void selection_extend(MiniEventState *st, struct MiniNode *t,
 {
     if (!st->sel.is_selecting || !t)
         return;
-    struct MiniNode *tn = text_node_under(t, x, y);
+    float dist = 1e9f;
+    struct MiniNode *tn = text_node_under(t, x, y, &dist);
+    if ((!tn || dist > 8.0f) && st->doc && st->doc->body && t != st->doc->body)
+    {
+        float dist2 = 1e9f;
+        struct MiniNode *tn2 = text_node_under(st->doc->body, x, y, &dist2);
+        if (tn2 && dist2 < dist)
+            tn = tn2;
+    }
     if (!tn)
         return;
     int off = text_offset_at(tn, x, y);
@@ -1978,13 +2018,15 @@ void mini_events_handle_mouse_move(MiniEventState *st, float x, float y, int mod
         int is_ta = !strcmp(it->tag, "textarea");
         float fs = s->font_size > 0 ? s->font_size : 12.0f;
         float ls = s->letter_set ? s->len_letter.v : 0.0f;
-        float x0 = s->abs_x + (is_ta ? 4.0f : 5.0f);
+        float pad_l = (s->padding[3] > 0.0f) ? s->padding[3] : (is_ta ? 4.0f : 5.0f);
+        float pad_t = (s->padding[0] > 0.0f) ? s->padding[0] : 4.0f;
+        float x0 = s->abs_x + pad_l;
         const char *val = control_value_get(it);
         int new_off = 0;
         if (is_ta)
         {
-            float y0 = s->abs_y + 4.0f;
-            float line_h = fs + 4.0f;
+            float y0 = s->abs_y + pad_t;
+            float line_h = mini_text_line_height(fs);
             int target_line = (int)((y - y0) / line_h);
             if (target_line < 0) target_line = 0;
             int L = (int)strlen(val);
@@ -2132,12 +2174,14 @@ void mini_events_handle_mouse_button(MiniEventState *st, int button, int action,
                 int is_ta = !strcmp(t->tag, "textarea");
                 float fs = s->font_size > 0 ? s->font_size : 12.0f;
                 float ls = s->letter_set ? s->len_letter.v : 0.0f;
-                float x0 = s->abs_x + (is_ta ? 4.0f : 5.0f);
+                float pad_l = (s->padding[3] > 0.0f) ? s->padding[3] : (is_ta ? 4.0f : 5.0f);
+                float pad_t = (s->padding[0] > 0.0f) ? s->padding[0] : 4.0f;
+                float x0 = s->abs_x + pad_l;
                 const char *val = control_value_get(t);
                 if (is_ta)
                 {
-                    float y0 = s->abs_y + 4.0f;
-                    float line_h = fs + 4.0f;
+                    float y0 = s->abs_y + pad_t;
+                    float line_h = mini_text_line_height(fs);
                     int target_line = (int)((y - y0) / line_h);
                     if (target_line < 0)
                         target_line = 0;
@@ -2284,21 +2328,25 @@ void mini_events_handle_mouse_button(MiniEventState *st, int button, int action,
                             const char *href = mini_node_get_attribute(anc, "href");
                             if (href && href[0] == '#')
                             {
-                                if (href[1] == '\0')
-                                {
-                                    st->doc->scroll_y = 0.0f;
-                                }
-                                else
+                                float target_y = 0.0f;
+                                if (href[1] != '\0')
                                 {
                                     struct MiniNode *tgt = mini_dom_query_selector(st->doc, href);
                                     if (tgt)
                                     {
-                                        st->doc->scroll_y = tgt->style.abs_y;
-                                        if (st->doc->scroll_y > st->doc->max_scroll_y)
-                                            st->doc->scroll_y = st->doc->max_scroll_y;
+                                        /* 减去顶部 Fixed 导航栏高度 (64px) 及少许呼吸内边距，使标题完美露在导航栏下方 */
+                                        target_y = tgt->style.abs_y - 64.0f;
+                                        if (target_y < 0.0f)
+                                            target_y = 0.0f;
+                                        if (target_y > st->doc->max_scroll_y)
+                                            target_y = st->doc->max_scroll_y;
                                     }
                                 }
+                                st->doc->scroll_target_y = target_y;
+                                st->doc->is_smooth_scrolling = 1;
                                 st->doc->dirty = 1;
+                                st->doc->paint_dirty = 1;
+                                break;
                             }
                             break;
                         }

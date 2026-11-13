@@ -26,6 +26,20 @@ extern "C"
 {
 #endif
 
+    /* ========================================================================
+     * RENDERER BACKEND CONFIGURATION
+     *
+     * Set to 1 to activate the legacy OpenGL renderer (requires setting this
+     * static constant).
+     *
+     * Set to 0 to use the high-performance multi-threaded Vulkan renderer
+     * (default, using Vulkan SDK at D:\vulkan).
+     * ======================================================================== */
+    #ifndef MINI_USE_OPENGL
+    #define MINI_USE_OPENGL 0
+    #endif
+    static const int MINI_USE_OPENGL_BACKEND = MINI_USE_OPENGL;
+
     /* ------------------------------------------------------------------ */
     /* GPU context + window surface                                       */
     /* ------------------------------------------------------------------ */
@@ -39,6 +53,8 @@ extern "C"
         /* current blend/depth state cache, avoids redundant gl* toggles */
         uint8_t blend_on;
         uint8_t depth_on;
+        int is_vulkan;        /* 1 = Vulkan backend, 0 = OpenGL backend */
+        void *vk_backend;     /* MiniVkContext* handle */
     } MiniGPUContext;
 
     /* ------------------------------------------------------------------ */
@@ -134,6 +150,7 @@ extern "C"
         unsigned char *ttf_data; /* malloc'd TTF file bytes */
         int loaded;              /* 1 once TTF is initialized */
         int ascent, descent, line_gap;
+        char family[32];         /* Font family name */
     } MiniFontEntry;
 
     /* ------------------------------------------------------------------ */

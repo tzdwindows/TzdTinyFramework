@@ -1,52 +1,96 @@
 #include "mini_audio.h"
-#include <windows.h>
-#include <mmsystem.h>
-#include <stdlib.h>
+
+#define MA_NO_ENCODING
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+
 #include <string.h>
 
-#define MAX_AUDIO_BUFFERS 16
-#define BUFFER_SAMPLES 2048
+#define AUDIO_RING_FRAMES 65536
 
-static HWAVEOUT g_hWaveOut = NULL;
-static int g_sample_rate = 44100;
-static int g_channels = 1;
-static WAVEHDR g_headers[MAX_AUDIO_BUFFERS];
-static short *g_buffers[MAX_AUDIO_BUFFERS];
-static int g_buf_idx = 0;
+static ma_device g_device;
+static ma_pcm_rb g_rb;
 static int g_initialized = 0;
+static int g_channels = 1;
+static float g_last_sample[2] = {0.0f, 0.0f};
+
+static void ma_data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uint32 frameCount)
+{
+    (void)pDevice;
+    (void)pInput;
+
+    float *out = (float *)pOutput;
+    ma_uint32 ch = (ma_uint32)g_channels;
+    ma_uint32 frames_read = 0;
+
+    while (frames_read < frameCount)
+    {
+        ma_uint32 avail = frameCount - frames_read;
+        void *pRead = NULL;
+        ma_pcm_rb_acquire_read(&g_rb, &avail, &pRead);
+        if (avail == 0 || !pRead)
+            break;
+
+        const float *src = (const float *)pRead;
+        size_t n_floats = (size_t)avail * ch;
+        float *dst = out + (size_t)frames_read * ch;
+        for (size_t i = 0; i < n_floats; i++)
+        {
+            float s = src[i];
+            if (s > 1.0f) s = 1.0f;
+            else if (s < -1.0f) s = -1.0f;
+            dst[i] = s;
+            g_last_sample[i % ch] = s;
+        }
+
+        ma_pcm_rb_commit_read(&g_rb, avail);
+        frames_read += avail;
+    }
+
+    /* Smoothly decay to zero on underrun so there is no step click */
+    for (ma_uint32 f = frames_read; f < frameCount; f++)
+    {
+        for (ma_uint32 c = 0; c < ch; c++)
+        {
+            g_last_sample[c] *= 0.92f;
+            if (g_last_sample[c] > -1e-5f && g_last_sample[c] < 1e-5f)
+                g_last_sample[c] = 0.0f;
+            out[(size_t)f * ch + c] = g_last_sample[c];
+        }
+    }
+}
 
 int mini_audio_init(int sample_rate, int channels)
 {
-    if (g_initialized && g_hWaveOut)
+    if (g_initialized)
         return 0;
 
-    g_sample_rate = sample_rate > 0 ? sample_rate : 44100;
+    ma_uint32 sr = (sample_rate > 0) ? (ma_uint32)sample_rate : 44100;
     g_channels = (channels == 2) ? 2 : 1;
+    g_last_sample[0] = 0.0f;
+    g_last_sample[1] = 0.0f;
 
-    WAVEFORMATEX wfx;
-    memset(&wfx, 0, sizeof(wfx));
-    wfx.wFormatTag = WAVE_FORMAT_PCM;
-    wfx.nChannels = (WORD)g_channels;
-    wfx.nSamplesPerSec = (DWORD)g_sample_rate;
-    wfx.wBitsPerSample = 16;
-    wfx.nBlockAlign = (WORD)(wfx.nChannels * (wfx.wBitsPerSample / 8));
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-    wfx.cbSize = 0;
+    if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)g_channels, AUDIO_RING_FRAMES, NULL, NULL, &g_rb) != MA_SUCCESS)
+        return -1;
 
-    MMRESULT res = waveOutOpen(&g_hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
-    if (res != MMSYSERR_NOERROR)
+    ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
+    cfg.playback.format   = ma_format_f32;
+    cfg.playback.channels = (ma_uint32)g_channels;
+    cfg.sampleRate        = sr;
+    cfg.dataCallback      = ma_data_callback;
+    cfg.periodSizeInMilliseconds = 10;
+
+    if (ma_device_init(NULL, &cfg, &g_device) != MA_SUCCESS)
     {
-        g_hWaveOut = NULL;
+        ma_pcm_rb_uninit(&g_rb);
         return -1;
     }
 
-    for (int i = 0; i < MAX_AUDIO_BUFFERS; i++)
+    if (ma_device_start(&g_device) != MA_SUCCESS)
     {
-        g_buffers[i] = (short *)calloc(BUFFER_SAMPLES * g_channels, sizeof(short));
-        memset(&g_headers[i], 0, sizeof(WAVEHDR));
-        g_headers[i].lpData = (LPSTR)g_buffers[i];
-        g_headers[i].dwBufferLength = (DWORD)(BUFFER_SAMPLES * g_channels * sizeof(short));
-        g_headers[i].dwFlags = WHDR_DONE;
+        ma_device_uninit(&g_device);
+        ma_pcm_rb_uninit(&g_rb);
+        return -1;
     }
 
     g_initialized = 1;
@@ -55,82 +99,43 @@ int mini_audio_init(int sample_rate, int channels)
 
 void mini_audio_shutdown(void)
 {
-    if (!g_initialized || !g_hWaveOut)
+    if (!g_initialized)
         return;
 
-    waveOutReset(g_hWaveOut);
-    for (int i = 0; i < MAX_AUDIO_BUFFERS; i++)
-    {
-        if (g_headers[i].dwFlags & WHDR_PREPARED)
-            waveOutUnprepareHeader(g_hWaveOut, &g_headers[i], sizeof(WAVEHDR));
-        free(g_buffers[i]);
-        g_buffers[i] = NULL;
-    }
-    waveOutClose(g_hWaveOut);
-    g_hWaveOut = NULL;
+    ma_device_uninit(&g_device);
+    ma_pcm_rb_uninit(&g_rb);
     g_initialized = 0;
 }
 
 void mini_audio_queue_pcm(const float *samples, size_t count)
 {
-    if (!g_initialized || !g_hWaveOut || !samples || count == 0)
+    if (!g_initialized || !samples || count == 0)
         return;
 
-    size_t offset = 0;
-    while (offset < count)
+    ma_uint32 ch = (ma_uint32)g_channels;
+    ma_uint32 frames_total = (ma_uint32)(count / ch);
+    ma_uint32 frames_written = 0;
+
+    while (frames_written < frames_total)
     {
-        WAVEHDR *hdr = &g_headers[g_buf_idx];
-        short *buf = g_buffers[g_buf_idx];
+        ma_uint32 space = frames_total - frames_written;
+        void *pWrite = NULL;
+        ma_pcm_rb_acquire_write(&g_rb, &space, &pWrite);
+        if (space == 0 || !pWrite)
+            break;
 
-        // Wait or skip if buffer still in use
-        if ((hdr->dwFlags & WHDR_PREPARED) && !(hdr->dwFlags & WHDR_DONE))
+        const float *src = samples + (size_t)frames_written * ch;
+        float *dst = (float *)pWrite;
+        size_t n_floats = (size_t)space * ch;
+        for (size_t i = 0; i < n_floats; i++)
         {
-            // Try next slot
-            int found = -1;
-            for (int k = 0; k < MAX_AUDIO_BUFFERS; k++)
-            {
-                if (g_headers[k].dwFlags & WHDR_DONE)
-                {
-                    found = k;
-                    break;
-                }
-            }
-            if (found >= 0)
-            {
-                g_buf_idx = found;
-                hdr = &g_headers[g_buf_idx];
-                buf = g_buffers[g_buf_idx];
-            }
-            else
-            {
-                break; // All buffers full
-            }
-        }
-
-        if (hdr->dwFlags & WHDR_PREPARED)
-            waveOutUnprepareHeader(g_hWaveOut, hdr, sizeof(WAVEHDR));
-
-        size_t chunk = count - offset;
-        size_t max_samples = BUFFER_SAMPLES * (size_t)g_channels;
-        if (chunk > max_samples)
-            chunk = max_samples;
-
-        for (size_t i = 0; i < chunk; i++)
-        {
-            float s = samples[offset + i];
+            float s = src[i];
             if (s > 1.0f) s = 1.0f;
             else if (s < -1.0f) s = -1.0f;
-            buf[i] = (short)(s * 32767.0f);
+            dst[i] = s;
         }
 
-        hdr->lpData = (LPSTR)buf;
-        hdr->dwBufferLength = (DWORD)(chunk * sizeof(short));
-        hdr->dwFlags = 0;
-
-        waveOutPrepareHeader(g_hWaveOut, hdr, sizeof(WAVEHDR));
-        waveOutWrite(g_hWaveOut, hdr, sizeof(WAVEHDR));
-
-        offset += chunk;
-        g_buf_idx = (g_buf_idx + 1) % MAX_AUDIO_BUFFERS;
+        ma_pcm_rb_commit_write(&g_rb, space);
+        frames_written += space;
     }
 }

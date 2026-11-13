@@ -1276,6 +1276,12 @@ void mini_cdp_emit_log(MiniCDP *cdp, const char *level, const char *text)
 /* SHA-1 self-test (gcc -DCDP_SELFTEST mini_cdp_server.c -lws2_32)     */
 /* ================================================================== */
 #ifdef CDP_SELFTEST
+void mini_cdp_dispatch(MiniCDP *cdp, int client_idx, const char *msg) { (void)cdp; (void)client_idx; (void)msg; }
+const char *mini_doc_get_title(const MiniDocument *doc) { (void)doc; return ""; }
+const char *mini_bridge_get_doc_url(const MiniBridge *b) { (void)b; return ""; }
+void mini_cdp_network_flush(MiniCDP *cdp) { (void)cdp; }
+void mini_cdp_screencast_flush(MiniCDP *cdp) { (void)cdp; }
+
 static void hex20(const uint8_t *d)
 {
     for (int i = 0; i < 20; i++)

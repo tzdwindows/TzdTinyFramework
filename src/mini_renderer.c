@@ -12,11 +12,21 @@
  * which is where a software composite path earns its keep.
  */
 #include "mini_renderer.h"
+#include "mini_vulkan.h"
 #include "mini_dom.h"
 #include "mini_png.h"
 #include "mini_raster_asm.h"
+#include "stb_image.h"
 
 #include <GLFW/glfw3.h> /* platform window + GL context */
+#if defined(_WIN32)
+#ifndef WINGDIAPI
+#define WINGDIAPI __declspec(dllimport)
+#endif
+#ifndef APIENTRY
+#define APIENTRY __stdcall
+#endif
+#endif
 #include <GL/gl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1100,7 +1110,7 @@ static TtGlyph *tt_get_glyph(MiniRenderer *r, unsigned int cp, float font_size)
         int glyph_idx = stbtt_FindGlyphIndex(info, (int)cp);
         if (glyph_idx > 0)
         {
-            float s = stbtt_ScaleForPixelHeight(info, fs);
+            float s = stbtt_ScaleForMappingEmToPixels(info, fs);
             if (s > 0.0f)
             {
                 int tg_w = 0, tg_h = 0, tg_xo = 0, tg_yo = 0;
@@ -1123,7 +1133,7 @@ static TtGlyph *tt_get_glyph(MiniRenderer *r, unsigned int cp, float font_size)
     if (!chosen_info && r->num_fonts > 0 && r->fonts[0].font_ctx)
     {
         chosen_info = (stbtt_fontinfo *)r->fonts[0].font_ctx;
-        scale = stbtt_ScaleForPixelHeight(chosen_info, fs);
+        scale = stbtt_ScaleForMappingEmToPixels(chosen_info, fs);
     }
 
     if (!bmp)
@@ -1140,22 +1150,25 @@ static TtGlyph *tt_get_glyph(MiniRenderer *r, unsigned int cp, float font_size)
         int advance = 0, lsb = 0;
         if (chosen_info && scale > 0.0f)
             stbtt_GetCodepointHMetrics(chosen_info, (int)cp, &advance, &lsb);
-        g->advance = (scale > 0.0f && advance > 0) ? scale * (float)advance : FONT_ADV(fs);
+        g->advance = (scale > 0.0f && advance > 0) ? scale * (float)advance : (cp >= 0x2E80 ? fs : FONT_ADV(fs));
         return g;
     }
 
     int cell_w = gw + TT_ATLAS_PAD * 2;
     int cell_h = gh + TT_ATLAS_PAD * 2;
 
-    if (r->tt_atlas_x + cell_w > r->atlas_w)
+    if (r->tt_atlas_x + cell_w > 1024)
     {
         r->tt_atlas_x = 0;
         r->tt_atlas_y += r->tt_atlas_row_h + TT_ATLAS_PAD;
         r->tt_atlas_row_h = 0;
     }
 
-    /* 如果图集需要被抹除，先执行 Flush 把已压入并绑定旧 UV 坐标的命令给绘制完毕！ */
-    if (first_empty < 0 || r->tt_atlas_y + cell_h > r->atlas_h)
+    /* 如果图集需要被抹除，先执行 Flush 把已压入并绑定旧 UV 坐标的命令给绘制完毕！
+       Keep glyph atlas within top-left quadrant (x < 1024, y < 1024).
+       Top-right quadrant (x = 1024..2047, y = 0..1023) is reserved for DOM images.
+       Bottom half (y = 1024..2047) is reserved for live WebGL framebuffer compositing in Vulkan mode. */
+    if (first_empty < 0 || r->tt_atlas_y + cell_h > 1024)
     {
         mini_renderer_flush(r);
         memset(r->tt_cache, 0, sizeof(r->tt_cache));
@@ -1163,7 +1176,10 @@ static TtGlyph *tt_get_glyph(MiniRenderer *r, unsigned int cp, float font_size)
         r->tt_atlas_y = 0;
         r->tt_atlas_row_h = 0;
         if (r->atlas_cpu)
-            memset(r->atlas_cpu, 0, (size_t)r->atlas_w * (size_t)r->atlas_h * sizeof(uint32_t));
+        {
+            for (int gy = 0; gy < 1024; gy++)
+                memset(r->atlas_cpu + (size_t)gy * r->atlas_w, 0, 1024 * sizeof(uint32_t));
+        }
         first_empty = (int)(hash & (TT_GLYPH_CAP - 1));
     }
 
@@ -1203,7 +1219,7 @@ static TtGlyph *tt_get_glyph(MiniRenderer *r, unsigned int cp, float font_size)
     g->gh = (int16_t)gh;
     g->xoff = (int16_t)xoff;
     g->yoff = (int16_t)yoff;
-    g->advance = (scale > 0.0f && advance > 0) ? scale * (float)advance : FONT_ADV(fs);
+    g->advance = (scale > 0.0f && advance > 0) ? scale * (float)advance : (cp >= 0x2E80 ? fs : FONT_ADV(fs));
     return g;
 }
 
@@ -1262,6 +1278,7 @@ int mini_renderer_load_font(MiniRenderer *r, const char *path)
     r->fonts[0].ttf_data = buf;
     r->fonts[0].font_ctx = info;
     r->fonts[0].loaded = 1;
+    r->fonts[0].family[0] = '\0';
     if (r->num_fonts < 1)
         r->num_fonts = 1;
 
@@ -1277,11 +1294,59 @@ int mini_renderer_load_font(MiniRenderer *r, const char *path)
     return 0;
 }
 
+typedef struct {
+    uint32_t gen;
+    uint32_t hash;
+    float font_size;
+    float letter_spacing;
+    float width;
+    char text[48];
+} TextMeasureCacheEntry;
+
+enum { TEXT_MEASURE_CACHE_SIZE = 1024 };
+static TextMeasureCacheEntry s_measure_cache[TEXT_MEASURE_CACHE_SIZE];
+static uint32_t s_measure_gen = 1;
+
+static uint32_t calc_measure_hash(const char *str, float fs, float ls)
+{
+    uint32_t h = 2166136261u;
+    while (*str)
+    {
+        h ^= (uint8_t)(*str++);
+        h *= 16777619u;
+    }
+    uint32_t fs_bits = 0, ls_bits = 0;
+    memcpy(&fs_bits, &fs, sizeof(fs));
+    memcpy(&ls_bits, &ls, sizeof(ls));
+    h ^= fs_bits;
+    h *= 16777619u;
+    h ^= ls_bits;
+    h *= 16777619u;
+    return h;
+}
+
 float mini_text_measure_ex(const char *text, float font_size, float letter_spacing)
 {
     if (!text || !*text || font_size <= 0)
         return 0.0f;
     font_init();
+
+    size_t tlen = strlen(text);
+    int can_cache = (tlen < sizeof(s_measure_cache[0].text));
+    uint32_t h = 0;
+    int idx = 0;
+    if (can_cache)
+    {
+        h = calc_measure_hash(text, font_size, letter_spacing);
+        idx = (int)(h & (TEXT_MEASURE_CACHE_SIZE - 1));
+        TextMeasureCacheEntry *e = &s_measure_cache[idx];
+        if (e->gen == s_measure_gen && e->hash == h &&
+            e->font_size == font_size && e->letter_spacing == letter_spacing &&
+            !strcmp(e->text, text))
+        {
+            return e->width;
+        }
+    }
 
     float w = 0.0f;
     const char *p = text;
@@ -1300,20 +1365,34 @@ float mini_text_measure_ex(const char *text, float font_size, float letter_spaci
             else
                 w += (cp >= 0x2E80 ? font_size : FONT_ADV(font_size)) + letter_spacing;
         }
-        return w > 0.0f ? w : 0.0f;
+        w = w > 0.0f ? w : 0.0f;
+    }
+    else
+    {
+        /* 核心排版修复：即使 TTF 字体未就绪（例如首帧 Layout 时），也必须按照 UTF-8 字符解码测距。
+           绝不能用单字节累加，否则 3字节的 CJK 字符会导致按钮等容器被撑大 3 倍，引发严重的右侧空隙与向左偏移！ */
+        while (*p)
+        {
+            unsigned int cp = utf8_next(&p, &len);
+            if (!len)
+                break;
+            /* 根据 Unicode 区间智能分配骨架宽度：CJK 字符给 1.0em，英文字符给 0.6em，保证骨架屏和最终渲染严丝合缝 */
+            w += (cp >= 0x2E80 ? font_size : FONT_ADV(font_size)) + letter_spacing;
+        }
+        w = w > 0.0f ? w - FONT_PX(font_size) : 0.0f;
     }
 
-    /* 核心排版修复：即使 TTF 字体未就绪（例如首帧 Layout 时），也必须按照 UTF-8 字符解码测距。
-       绝不能用单字节累加，否则 3字节的 CJK 字符会导致按钮等容器被撑大 3 倍，引发严重的右侧空隙与向左偏移！ */
-    while (*p)
+    if (can_cache)
     {
-        unsigned int cp = utf8_next(&p, &len);
-        if (!len)
-            break;
-        /* 根据 Unicode 区间智能分配骨架宽度：CJK 字符给 1.0em，英文字符给 0.6em，保证骨架屏和最终渲染严丝合缝 */
-        w += (cp >= 0x2E80 ? font_size : FONT_ADV(font_size)) + letter_spacing;
+        TextMeasureCacheEntry *e = &s_measure_cache[idx];
+        e->gen = s_measure_gen;
+        e->hash = h;
+        e->font_size = font_size;
+        e->letter_spacing = letter_spacing;
+        e->width = w;
+        memcpy(e->text, text, tlen + 1);
     }
-    return w > 0.0f ? w - FONT_PX(font_size) : 0.0f;
+    return w;
 }
 
 int mini_renderer_load_fallback_font(MiniRenderer *r, const char *path)
@@ -1364,6 +1443,7 @@ int mini_renderer_load_fallback_font(MiniRenderer *r, const char *path)
     r->fonts[idx].ttf_data = buf;
     r->fonts[idx].font_ctx = info;
     r->fonts[idx].loaded = 1;
+    r->fonts[idx].family[0] = '\0';
 
     r->fallback_font_ascent = r->fonts[idx].ascent;
     r->fallback_font_descent = r->fonts[idx].descent;
@@ -1371,6 +1451,7 @@ int mini_renderer_load_fallback_font(MiniRenderer *r, const char *path)
     r->fallback_ttf_data = buf;
     r->fallback_font_ctx = info;
     r->fallback_ttf_loaded = 1;
+    s_measure_gen++;
     return 0;
 }
 
@@ -1409,6 +1490,15 @@ int mini_renderer_add_font_data(MiniRenderer *r, const char *family, const uint8
     r->fonts[idx].ttf_data = buf;
     r->fonts[idx].font_ctx = info;
     r->fonts[idx].loaded = 1;
+    if (family && *family)
+    {
+        strncpy(r->fonts[idx].family, family, sizeof(r->fonts[idx].family) - 1);
+        r->fonts[idx].family[sizeof(r->fonts[idx].family) - 1] = '\0';
+    }
+    else
+    {
+        r->fonts[idx].family[0] = '\0';
+    }
 
     r->fallback_font_ascent = r->fonts[idx].ascent;
     r->fallback_font_descent = r->fonts[idx].descent;
@@ -1416,6 +1506,7 @@ int mini_renderer_add_font_data(MiniRenderer *r, const char *family, const uint8
     r->fallback_ttf_data = buf;
     r->fallback_font_ctx = info;
     r->fallback_ttf_loaded = 1;
+    s_measure_gen++;
     return 0;
 }
 
@@ -1468,8 +1559,8 @@ float mini_text_measure(const char *text, float font_size)
 
 float mini_text_line_height(float font_size)
 {
-    /* 1.2x is the standard CSS line-height default for a font box. */
-    return font_size > 0 ? font_size * 1.2f : 0.0f;
+    /* 1.5x is the standard CSS line-height default for typography and buttons. */
+    return font_size > 0 ? font_size * 1.5f : 0.0f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1491,12 +1582,88 @@ MiniRenderer *mini_renderer_create(int width, int height,
 MiniRenderer *mini_renderer_create_window(int width, int height, int samples,
                                           int vsync, const MiniRendererHints *hints)
 {
-    /* Become DPI-aware before the window is created so the GL framebuffer is
+    /* Become DPI-aware before the window is created so the framebuffer is
        at device resolution (no DWM bitmap upscale -> crisp on high-DPI). */
     mini_set_dpi_aware();
     if (!glfwInit())
         return NULL;
 
+    /* ---- Vulkan Multi-Threaded Renderer Backend (Default) ---- */
+    if (!MINI_USE_OPENGL_BACKEND)
+    {
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        glfwWindowHint(GLFW_RESIZABLE,
+                       (!hints || hints->resizable != 0) ? GLFW_TRUE : GLFW_FALSE);
+        glfwWindowHint(GLFW_DECORATED,
+                       (!hints || hints->decorated != 0) ? GLFW_TRUE : GLFW_FALSE);
+        glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER,
+                       (hints && hints->transparent) ? GLFW_TRUE : GLFW_FALSE);
+        glfwWindowHint(GLFW_FLOATING,
+                       (hints && hints->always_on_top) ? GLFW_TRUE : GLFW_FALSE);
+        if (hints && hints->maximized)
+            glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+
+        GLFWmonitor *mon = NULL;
+        if (hints && hints->fullscreen)
+            mon = glfwGetPrimaryMonitor();
+
+        GLFWwindow *win = glfwCreateWindow(width, height, "TinyFramework", mon, NULL);
+        if (!win)
+            return NULL;
+
+        MiniRenderer *r = (MiniRenderer *)calloc(1, sizeof(*r));
+        if (!r)
+        {
+            glfwDestroyWindow(win);
+            return NULL;
+        }
+
+        r->gpu.window_handle = win;
+        r->gpu.width = width;
+        r->gpu.height = height;
+        r->gpu.sample_count = samples;
+        r->gpu.vsync = vsync;
+        r->gpu.is_vulkan = 1;
+        r->gpu.vk_backend = mini_vk_create(win, width, height, vsync, samples);
+
+        if (!r->gpu.vk_backend)
+        {
+            fprintf(stderr, "[vulkan] Vulkan initialization failed, falling back to OpenGL\n");
+            free(r);
+            glfwDestroyWindow(win);
+            /* Falls through to legacy OpenGL setup below */
+        }
+        else
+        {
+            r->atlas_w = 2048;
+            r->atlas_h = 2048;
+            r->atlas_cpu = (uint32_t *)calloc((size_t)r->atlas_w * r->atlas_h, sizeof(uint32_t));
+            r->vbuf.width = width;
+            r->vbuf.height = height;
+
+            /* Create a hidden offscreen OpenGL context so WebGL 1/2 (Three.js, etc.)
+               renders on GPU and composites seamlessly into the Vulkan atlas. */
+            glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+            glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+            glfwWindowHint(GLFW_DEPTH_BITS, 24);
+            glfwWindowHint(GLFW_STENCIL_BITS, 8);
+            GLFWwindow *gl_offscreen = glfwCreateWindow(width > 0 ? width : 1280, height > 0 ? height : 800, "", NULL, NULL);
+            glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+            if (gl_offscreen)
+            {
+                glfwMakeContextCurrent(gl_offscreen);
+                glfwSwapInterval(0);
+                mini_gl_init_foundation();
+                r->gl_state = mini_gl_bridge_new();
+            }
+
+            return r;
+        }
+    }
+
+    /* ---- Legacy OpenGL 1.1/2.1 Renderer Backend ---- */
     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
@@ -1620,13 +1787,22 @@ void mini_renderer_destroy(MiniRenderer *r)
     if (g_active_renderer == r)
         g_active_renderer = NULL;
     free(r->atlas_cpu);
-    if (r->atlas_texture)
-        glDeleteTextures(1, &r->atlas_texture);
-    /* Free every cached gradient texture (slots with tex==0 are empty). */
-    for (int i = 0; i < MINI_GRAD_CACHE_CAP; i++)
-        if (r->grad_cache[i].tex)
-            glDeleteTextures(1, &r->grad_cache[i].tex);
-    mini_gl_bridge_destroy(r->gl_state);
+
+    if (r->gpu.is_vulkan && r->gpu.vk_backend)
+    {
+        mini_vk_destroy((MiniVkContext *)r->gpu.vk_backend);
+        r->gpu.vk_backend = NULL;
+    }
+    else
+    {
+        if (r->atlas_texture)
+            glDeleteTextures(1, &r->atlas_texture);
+        /* Free every cached gradient texture (slots with tex==0 are empty). */
+        for (int i = 0; i < MINI_GRAD_CACHE_CAP; i++)
+            if (r->grad_cache[i].tex)
+                glDeleteTextures(1, &r->grad_cache[i].tex);
+        mini_gl_bridge_destroy(r->gl_state);
+    }
     if (r->gpu.window_handle)
         glfwDestroyWindow((GLFWwindow *)r->gpu.window_handle);
     free(r);
@@ -1662,6 +1838,12 @@ void mini_renderer_begin_frame(MiniRenderer *r)
     r->gpu.height = fh;
     r->vbuf.width = fw;
     r->vbuf.height = fh;
+
+    if (r->gpu.is_vulkan)
+    {
+        mini_vk_begin_frame((MiniVkContext *)r->gpu.vk_backend, fw, fh);
+        return;
+    }
 
     glViewport(0, 0, fw, fh);
     mini_gl_bridge_reset_2d(r->gl_state);
@@ -3070,6 +3252,13 @@ void mini_draw_gradient(MiniRenderer *r, float x, float y, float w, float h,
 
 void mini_renderer_flush(MiniRenderer *r)
 {
+    if (!r) return;
+    if (r->gpu.is_vulkan)
+    {
+        mini_vk_flush((MiniVkContext *)r->gpu.vk_backend, r);
+        r->vbuf.count = 0;
+        return;
+    }
     /* Simple state sort: keep CLEAR first, then draw in z order as
        recorded. A production build keys the sort on (texture_id, blend)
        to minimize bind toggles. */
@@ -3080,18 +3269,25 @@ void mini_renderer_flush(MiniRenderer *r)
 
 void mini_renderer_end_frame(MiniRenderer *r)
 {
+    if (!r) return;
+    if (r->gpu.is_vulkan)
+    {
+        mini_vk_end_frame((MiniVkContext *)r->gpu.vk_backend);
+        return;
+    }
     /* poll happens in the main loop; swap here. */
     glfwSwapBuffers((GLFWwindow *)r->gpu.window_handle);
 }
 
 void mini_renderer_restore_webgl(MiniRenderer *r)
 {
+    if (!r || r->gpu.is_vulkan) return;
     /* Undo the bridge_reset_2d state-zeroing (program/VAO/buffer/texture 0)
        done in begin_frame so the legacy glBegin/glEnd DOM pass could run. Must
        be called after mini_renderer_flush and before mini_bridge_fire_raf, or
        WebGL apps that cache GL state (Three.js) draw with no program/VAO ->
        no fragments. */
-    if (r && r->gl_state)
+    if (r->gl_state)
         mini_gl_bridge_restore_webgl(r->gl_state);
 }
 
@@ -3583,15 +3779,31 @@ void mini_draw_shadow_corners(MiniRenderer *r, float x, float y, float w, float 
 /* Simple background image texture cache */
 typedef struct MiniImgCacheEntry
 {
-    char url[256];
+    uint64_t url_hash;
     GLuint tex;
     int w, h;
+    int atlas_x, atlas_y;
+    int atlas_w, atlas_h;
 } MiniImgCacheEntry;
 
-#define MINI_IMG_CACHE_CAP 32
+static uint64_t mini_hash_url(const char *s)
+{
+    uint64_t h = 14695981039346656037ULL;
+    while (*s)
+    {
+        h ^= (uint8_t)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+#define MINI_IMG_CACHE_CAP 64
 
 static MiniImgCacheEntry g_img_cache[MINI_IMG_CACHE_CAP];
 static int g_img_cache_n = 0;
+static int g_img_atlas_x = 1024;
+static int g_img_atlas_y = 0;
+static int g_img_atlas_row_h = 0;
 
 static void blur_pool_ensure(int w, int h)
 {
@@ -3828,18 +4040,28 @@ static GLuint run_fast_gaussian_blur(GLuint src_tex, int src_w, int src_h, float
     return g_blur_pool.tex[2];
 }
 
-static GLuint get_or_load_image_tex(const char *url, int *out_w, int *out_h)
+static GLuint get_or_load_image_tex(MiniRenderer *r, const char *url, int *out_w, int *out_h,
+                                    int *out_ax, int *out_ay, int *out_aw, int *out_ah)
 {
     if (!url || !*url)
         return 0;
+    uint64_t uhash = mini_hash_url(url);
     for (int i = 0; i < g_img_cache_n; i++)
     {
-        if (!strcmp(g_img_cache[i].url, url))
+        if (g_img_cache[i].url_hash == uhash)
         {
             if (out_w)
                 *out_w = g_img_cache[i].w;
             if (out_h)
                 *out_h = g_img_cache[i].h;
+            if (out_ax)
+                *out_ax = g_img_cache[i].atlas_x;
+            if (out_ay)
+                *out_ay = g_img_cache[i].atlas_y;
+            if (out_aw)
+                *out_aw = g_img_cache[i].atlas_w;
+            if (out_ah)
+                *out_ah = g_img_cache[i].atlas_h;
             return g_img_cache[i].tex;
         }
     }
@@ -3851,37 +4073,147 @@ static GLuint get_or_load_image_tex(const char *url, int *out_w, int *out_h)
         return 0;
 
     uint8_t *rgba = NULL;
-    int iw = 0, ih = 0;
+    int iw = 0, ih = 0, channels = 0;
+    int is_stbi = 0;
     if (mini_png_decode_rgba(res.data, res.size, &rgba, &iw, &ih) != 0 || !rgba)
+    {
+        rgba = stbi_load_from_memory(res.data, (int)res.size, &iw, &ih, &channels, 4);
+        is_stbi = (rgba != NULL);
+    }
+    if (!rgba)
     {
         mini_dom_free_resource(&res);
         return 0;
     }
     mini_dom_free_resource(&res);
 
+    int tw = iw, th = ih;
+    if (tw > 1024)
+    {
+        th = (int)((long long)th * 1024 / tw);
+        tw = 1024;
+    }
+    if (th > 1024)
+    {
+        tw = (int)((long long)tw * 1024 / th);
+        th = 1024;
+    }
+    if (tw < 1) tw = 1;
+    if (th < 1) th = 1;
+
+    if (g_img_atlas_x + tw > 2048)
+    {
+        g_img_atlas_x = 1024;
+        g_img_atlas_y += g_img_atlas_row_h;
+        g_img_atlas_row_h = 0;
+    }
+    if (g_img_atlas_y + th > 1024)
+    {
+        g_img_atlas_x = 1024;
+        g_img_atlas_y = 0;
+        g_img_atlas_row_h = 0;
+        g_img_cache_n = 0;
+    }
+
+    int ax = g_img_atlas_x;
+    int ay = g_img_atlas_y;
+    g_img_atlas_x += tw;
+    if (th > g_img_atlas_row_h)
+        g_img_atlas_row_h = th;
+
+    if (r && r->atlas_cpu)
+    {
+        if (tw == iw && th == ih)
+        {
+            for (int row = 0; row < th; row++)
+            {
+                uint32_t *dst = r->atlas_cpu + (size_t)(ay + row) * r->atlas_w + ax;
+                const uint32_t *src = (const uint32_t *)rgba + (size_t)row * iw;
+                memcpy(dst, src, (size_t)tw * sizeof(uint32_t));
+            }
+        }
+        else
+        {
+            for (int row = 0; row < th; row++)
+            {
+                int srow = (row * ih) / th;
+                if (srow >= ih) srow = ih - 1;
+                uint32_t *dst = r->atlas_cpu + (size_t)(ay + row) * r->atlas_w + ax;
+                const uint32_t *src = (const uint32_t *)rgba + (size_t)srow * iw;
+                for (int col = 0; col < tw; col++)
+                {
+                    int scol = (col * iw) / tw;
+                    if (scol >= iw) scol = iw - 1;
+                    dst[col] = src[scol];
+                }
+            }
+        }
+
+        if (r->gpu.is_vulkan && r->gpu.vk_backend)
+        {
+            extern void mini_vk_update_atlas(struct MiniVkContext *vk, int x, int y, int w, int h,
+                                             const uint32_t *src_rgba, int atlas_w, int atlas_h);
+            mini_vk_update_atlas((struct MiniVkContext *)r->gpu.vk_backend, ax, ay, tw, th,
+                                 r->atlas_cpu + (size_t)ay * r->atlas_w + ax, r->atlas_w, r->atlas_h);
+        }
+        else if (r->atlas_texture)
+        {
+            glBindTexture(GL_TEXTURE_2D, r->atlas_texture);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, r->atlas_w);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, ax, ay, tw, th,
+                            GL_RGBA, GL_UNSIGNED_BYTE,
+                            r->atlas_cpu + (size_t)ay * r->atlas_w + ax);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+    }
+
     GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    free(rgba);
+    if (!r || !r->gpu.is_vulkan)
+    {
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    else
+    {
+        tex = 1;
+    }
+
+    if (is_stbi)
+        stbi_image_free(rgba);
+    else
+        free(rgba);
 
     if (g_img_cache_n < MINI_IMG_CACHE_CAP)
     {
-        snprintf(g_img_cache[g_img_cache_n].url, sizeof(g_img_cache[g_img_cache_n].url), "%s", url);
+        g_img_cache[g_img_cache_n].url_hash = uhash;
         g_img_cache[g_img_cache_n].tex = tex;
         g_img_cache[g_img_cache_n].w = iw;
         g_img_cache[g_img_cache_n].h = ih;
+        g_img_cache[g_img_cache_n].atlas_x = ax;
+        g_img_cache[g_img_cache_n].atlas_y = ay;
+        g_img_cache[g_img_cache_n].atlas_w = tw;
+        g_img_cache[g_img_cache_n].atlas_h = th;
         g_img_cache_n++;
     }
     if (out_w)
         *out_w = iw;
     if (out_h)
         *out_h = ih;
+    if (out_ax)
+        *out_ax = ax;
+    if (out_ay)
+        *out_ay = ay;
+    if (out_aw)
+        *out_aw = tw;
+    if (out_ah)
+        *out_ah = th;
     return tex;
 }
 
@@ -3896,7 +4228,8 @@ void mini_draw_background_image(MiniRenderer *r, float x, float y, float w, floa
     if (!r || !url || !*url || w <= 0 || h <= 0)
         return;
     int img_w = 0, img_h = 0;
-    GLuint tex = get_or_load_image_tex(url, &img_w, &img_h);
+    int ax = 0, ay = 0, aw = 0, ah = 0;
+    GLuint tex = get_or_load_image_tex(r, url, &img_w, &img_h, &ax, &ay, &aw, &ah);
     if (!tex || img_w <= 0 || img_h <= 0)
         return;
 
@@ -3920,7 +4253,24 @@ void mini_draw_background_image(MiniRenderer *r, float x, float y, float w, floa
     float u_off = -pos_x / (dw > 0.0f ? dw : 1.0f);
     float v_off = -pos_y / (dh > 0.0f ? dh : 1.0f);
 
-    mini_draw_texture(r, x, y, w, h, tex, u_off, v_off, u_off + u_scale, v_off + v_scale);
+    if (r->gpu.is_vulkan && aw > 0 && ah > 0)
+    {
+        float base_u0 = (float)ax / (float)r->atlas_w;
+        float base_v0 = (float)ay / (float)r->atlas_h;
+        float base_uw = (float)aw / (float)r->atlas_w;
+        float base_vh = (float)ah / (float)r->atlas_h;
+
+        float final_u0 = base_u0 + u_off * base_uw;
+        float final_v0 = base_v0 + v_off * base_vh;
+        float final_u1 = base_u0 + (u_off + u_scale) * base_uw;
+        float final_v1 = base_v0 + (v_off + v_scale) * base_vh;
+
+        mini_draw_texture(r, x, y, w, h, tex, final_u0, final_v0, final_u1, final_v1);
+    }
+    else
+    {
+        mini_draw_texture(r, x, y, w, h, tex, u_off, v_off, u_off + u_scale, v_off + v_scale);
+    }
 }
 
 void mini_draw_texture_rounded(MiniRenderer *r, float x, float y, float w, float h,
@@ -3953,6 +4303,25 @@ void mini_draw_gradient_multi(MiniRenderer *r, float x, float y, float w, float 
 {
     if (!r || !stops || num_stops <= 0 || w <= 0 || h <= 0)
         return;
+
+    typedef struct {
+        float r, g, b, a;
+        float pos;
+    } GradStopResolvedLocal;
+    const GradStopResolvedLocal *s = (const GradStopResolvedLocal *)stops;
+    float rad = (radii && (radii[0] > 0 || radii[1] > 0 || radii[2] > 0 || radii[3] > 0)) ? radii[0] : 0.0f;
+
+    if (r->gpu.is_vulkan || num_stops <= 2)
+    {
+        const GradStopResolvedLocal *s0 = &s[0];
+        const GradStopResolvedLocal *s1 = &s[num_stops - 1];
+        mini_draw_gradient_ex(r, x, y, w, h,
+                              s0->r, s0->g, s0->b, s0->a,
+                              s1->r, s1->g, s1->b, s1->a,
+                              type, angle, rad);
+        return;
+    }
+
     int bw = (int)(w + 0.5f), bh = (int)(h + 0.5f);
     int rw, rh;
     grad_raster_dims(bw, bh, &rw, &rh);
@@ -4031,6 +4400,9 @@ int mini_renderer_screenshot_png(MiniRenderer *r, uint8_t **out, size_t *out_len
 {
     if (!r || !out || !out_len || !r->gpu.window_handle)
         return -1;
+    if (r->gpu.is_vulkan)
+        return mini_vk_screenshot_png((MiniVkContext *)r->gpu.vk_backend, out, out_len);
+
     *out = NULL;
     *out_len = 0;
     int w = r->gpu.width, h = r->gpu.height;
@@ -4208,6 +4580,13 @@ void mini_atlas_blit_glyph(MiniRenderer *r,
         mini_blend_row(s, d, (size_t)cw);
     }
 
+    if (r->gpu.is_vulkan)
+    {
+        mini_vk_update_atlas((MiniVkContext *)r->gpu.vk_backend, dst_x, dst_y, cw, ch,
+                             r->atlas_cpu + (size_t)dst_y * r->atlas_w + dst_x, r->atlas_w, r->atlas_h);
+        return;
+    }
+
     /* upload the dirty sub-rect to the GL texture */
     glBindTexture(GL_TEXTURE_2D, r->atlas_texture);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, r->atlas_w);
@@ -4242,6 +4621,7 @@ void mini_draw_rect_stroke(MiniRenderer *r, float x, float y, float w, float h,
     c.g = cg;
     c.b = cb;
     c.a = ca;
+    c.u1 = (line_w > 0.0f) ? line_w : 1.0f;
     c.reserved = (line_w > 0 && line_w < 0x7fffffff) ? (int)line_w : 1;
     mini_push(r, c);
 }
@@ -4262,6 +4642,7 @@ void mini_draw_line(MiniRenderer *r, float x1, float y1, float x2, float y2,
     c.g = cg;
     c.b = cb;
     c.a = ca;
+    c.u1 = (line_w > 0.0f) ? line_w : 1.0f;
     c.reserved = (line_w > 0 && line_w < 0x7fffffff) ? (int)line_w : 1;
     mini_push(r, c);
 }
@@ -4324,7 +4705,7 @@ void mini_draw_text_styled(MiniRenderer *r, float x, float y, const char *text,
         stbtt_fontinfo *info = (stbtt_fontinfo *)r->font_ctx;
         int bucket = tt_size_bucket(font_size);
         float fs = tt_bucket_to_size(bucket);
-        float scale = stbtt_ScaleForPixelHeight(info, fs);
+        float scale = stbtt_ScaleForMappingEmToPixels(info, fs);
         float scaled_ascent = (float)r->font_ascent * scale;
         float baseline = floorf(fy + (scaled_ascent > 0.0f ? scaled_ascent : fs * 0.75f) + 0.5f);
         const char *p = text;
