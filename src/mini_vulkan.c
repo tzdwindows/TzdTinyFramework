@@ -6,12 +6,19 @@
  * dynamic vertex staging, and texture atlas uploading.
  */
 
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,9 +57,18 @@ typedef struct MiniVkPushConstants {
 struct MiniVkContext;
 
 typedef struct MiniVkWorker {
+#ifdef _WIN32
     HANDLE thread_handle;
     HANDLE start_event;
     HANDLE done_event;
+#else
+    pthread_t thread_handle;
+    pthread_mutex_t mutex;
+    pthread_cond_t start_cond;
+    pthread_cond_t done_cond;
+    int work_ready;
+    int work_done;
+#endif
     int thread_id;
     int should_exit;
     struct MiniVkContext *vk;
@@ -512,12 +528,24 @@ static inline void emit_xform_stroke_aa(MiniVkVertex *v_base, uint32_t *count, u
 /* ------------------------------------------------------------------ */
 /* Worker Thread Worker Procedure                                     */
 /* ------------------------------------------------------------------ */
+#ifdef _WIN32
 static unsigned __stdcall mini_vk_worker_proc(void *arg) {
+#else
+static void *mini_vk_worker_proc(void *arg) {
+#endif
     MiniVkWorker *w = (MiniVkWorker *)arg;
     MiniVkContext *vk = w->vk;
 
     while (1) {
+#ifdef _WIN32
         WaitForSingleObject(w->start_event, INFINITE);
+#else
+        pthread_mutex_lock(&w->mutex);
+        while (!w->work_ready && !w->should_exit)
+            pthread_cond_wait(&w->start_cond, &w->mutex);
+        w->work_ready = 0;
+        pthread_mutex_unlock(&w->mutex);
+#endif
         if (w->should_exit)
             break;
 
@@ -1679,10 +1707,21 @@ static unsigned __stdcall mini_vk_worker_proc(void *arg) {
 
         w->vertices_written = local_v_count;
         vkEndCommandBuffer(cb);
+#ifdef _WIN32
         SetEvent(w->done_event);
+#else
+        pthread_mutex_lock(&w->mutex);
+        w->work_done = 1;
+        pthread_cond_signal(&w->done_cond);
+        pthread_mutex_unlock(&w->mutex);
+#endif
     }
 
+#ifdef _WIN32
     return 0;
+#else
+    return NULL;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -2354,9 +2393,14 @@ MiniVkContext *mini_vk_create(void *glfw_window, int width, int height, int vsyn
     }
 
     /* 10. Multi-threaded Worker Pool Initialization */
+#ifdef _WIN32
     SYSTEM_INFO sys_info;
     GetSystemInfo(&sys_info);
     vk->num_workers = (int)sys_info.dwNumberOfProcessors;
+#else
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    vk->num_workers = (nprocs > 0) ? (int)nprocs : 2;
+#endif
     if (vk->num_workers < 2) vk->num_workers = 2;
     if (vk->num_workers > MINI_VK_MAX_THREADS) vk->num_workers = MINI_VK_MAX_THREADS;
 
@@ -2368,8 +2412,16 @@ MiniVkContext *mini_vk_create(void *glfw_window, int width, int height, int vsyn
         w->thread_id = t;
         w->vk = vk;
         w->should_exit = 0;
+#ifdef _WIN32
         w->start_event = CreateEvent(NULL, FALSE, FALSE, NULL);
         w->done_event  = CreateEvent(NULL, FALSE, FALSE, NULL);
+#else
+        pthread_mutex_init(&w->mutex, NULL);
+        pthread_cond_init(&w->start_cond, NULL);
+        pthread_cond_init(&w->done_cond, NULL);
+        w->work_ready = 0;
+        w->work_done = 0;
+#endif
         w->max_vertices = MINI_VK_MAX_VERTICES_PER_WORKER;
         w->vertex_offset_in_global_buffer = t * MINI_VK_MAX_VERTICES_PER_WORKER;
 
@@ -2390,7 +2442,11 @@ MiniVkContext *mini_vk_create(void *glfw_window, int width, int height, int vsyn
             vkAllocateCommandBuffers(vk->device, &cb_info, w->secondary_cb[i]);
         }
 
+#ifdef _WIN32
         w->thread_handle = (HANDLE)_beginthreadex(NULL, 0, mini_vk_worker_proc, w, 0, NULL);
+#else
+        pthread_create(&w->thread_handle, NULL, mini_vk_worker_proc, w);
+#endif
     }
 
     return vk;
@@ -2402,12 +2458,23 @@ void mini_vk_destroy(MiniVkContext *vk) {
 
     /* Terminate worker threads */
     for (int t = 0; t < vk->num_workers; t++) {
+#ifdef _WIN32
         vk->workers[t].should_exit = 1;
         SetEvent(vk->workers[t].start_event);
         WaitForSingleObject(vk->workers[t].thread_handle, 5000);
         CloseHandle(vk->workers[t].thread_handle);
         CloseHandle(vk->workers[t].start_event);
         CloseHandle(vk->workers[t].done_event);
+#else
+        pthread_mutex_lock(&vk->workers[t].mutex);
+        vk->workers[t].should_exit = 1;
+        pthread_cond_signal(&vk->workers[t].start_cond);
+        pthread_mutex_unlock(&vk->workers[t].mutex);
+        pthread_join(vk->workers[t].thread_handle, NULL);
+        pthread_cond_destroy(&vk->workers[t].start_cond);
+        pthread_cond_destroy(&vk->workers[t].done_cond);
+        pthread_mutex_destroy(&vk->workers[t].mutex);
+#endif
 
         for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroyCommandPool(vk->device, vk->workers[t].cmd_pool[i], NULL);
@@ -2760,7 +2827,9 @@ void mini_vk_flush(MiniVkContext *vk, struct MiniRenderer *r) {
         active_workers = (total_cmds > 0) ? (int)total_cmds : 1;
 
     uint32_t chunk_size = (total_cmds + active_workers - 1) / active_workers;
+#ifdef _WIN32
     HANDLE done_events[MINI_VK_MAX_THREADS];
+#endif
     VkCommandBuffer secondary_cbs[MINI_VK_MAX_THREADS];
 
     uint32_t flush_idx = vk->flush_count_in_frame;
@@ -2786,14 +2855,32 @@ void mini_vk_flush(MiniVkContext *vk, struct MiniRenderer *r) {
         w->max_vertices = (vk->worker_vert_used[t] < MINI_VK_MAX_VERTICES_PER_WORKER)
                           ? (MINI_VK_MAX_VERTICES_PER_WORKER - vk->worker_vert_used[t]) : 0;
 
-        done_events[t] = w->done_event;
         secondary_cbs[t] = w->secondary_cb_current;
 
+#ifdef _WIN32
+        done_events[t] = w->done_event;
         SetEvent(w->start_event);
+#else
+        pthread_mutex_lock(&w->mutex);
+        w->work_done = 0;
+        w->work_ready = 1;
+        pthread_cond_signal(&w->start_cond);
+        pthread_mutex_unlock(&w->mutex);
+#endif
     }
 
     /* Wait for all multi-threaded workers to complete */
+#ifdef _WIN32
     WaitForMultipleObjects(active_workers, done_events, TRUE, INFINITE);
+#else
+    for (int t = 0; t < active_workers; t++) {
+        MiniVkWorker *w = &vk->workers[t];
+        pthread_mutex_lock(&w->mutex);
+        while (!w->work_done)
+            pthread_cond_wait(&w->done_cond, &w->mutex);
+        pthread_mutex_unlock(&w->mutex);
+    }
+#endif
 
     for (int t = 0; t < active_workers; t++) {
         vk->worker_vert_used[t] += vk->workers[t].vertices_written;
