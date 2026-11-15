@@ -2108,8 +2108,16 @@ static int create_swapchain(MiniVkContext *vk) {
 
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == 0xFFFFFFFF) {
-        extent.width = vk->width;
-        extent.height = vk->height;
+        int fw = 0, fh = 0;
+        glfwGetFramebufferSize(vk->window, &fw, &fh);
+        uint32_t w = (fw > 0) ? (uint32_t)fw : (uint32_t)(vk->width > 0 ? vk->width : 1280);
+        uint32_t h = (fh > 0) ? (uint32_t)fh : (uint32_t)(vk->height > 0 ? vk->height : 720);
+        if (w < caps.minImageExtent.width) w = caps.minImageExtent.width;
+        if (w > caps.maxImageExtent.width) w = caps.maxImageExtent.width;
+        if (h < caps.minImageExtent.height) h = caps.minImageExtent.height;
+        if (h > caps.maxImageExtent.height) h = caps.maxImageExtent.height;
+        extent.width = w;
+        extent.height = h;
     }
     vk->swapchain_extent = extent;
 
@@ -2118,6 +2126,7 @@ static int create_swapchain(MiniVkContext *vk) {
     uint32_t pm_count = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(vk->physical_device, vk->surface, &pm_count, NULL);
     if (pm_count > 0) {
+        if (pm_count > 16) pm_count = 16;
         VkPresentModeKHR modes[16];
         vkGetPhysicalDeviceSurfacePresentModesKHR(vk->physical_device, vk->surface, &pm_count, modes);
         for (uint32_t i = 0; i < pm_count; i++) {
@@ -2128,6 +2137,20 @@ static int create_swapchain(MiniVkContext *vk) {
         }
     }
 
+    VkCompositeAlphaFlagBitsKHR comp_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) {
+        if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
+            comp_alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+        else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
+            comp_alpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+        else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
+            comp_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    }
+
+    VkImageUsageFlags img_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        img_usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
     VkSwapchainCreateInfoKHR sci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = vk->surface,
@@ -2136,10 +2159,10 @@ static int create_swapchain(MiniVkContext *vk) {
         .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         .imageExtent = extent,
         .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .imageUsage = img_usage,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .compositeAlpha = comp_alpha,
         .presentMode = present_mode,
         .clipped = VK_TRUE
     };
@@ -2223,8 +2246,19 @@ MiniVkContext *mini_vk_create(void *glfw_window, int width, int height, int vsyn
     vk->sample_count = sample_count;
 
     /* 1. Create Vulkan Instance */
+    if (!glfwVulkanSupported()) {
+        fprintf(stderr, "[vulkan] GLFW reports Vulkan is not supported\n");
+        free(vk);
+        return NULL;
+    }
+
     uint32_t ext_count = 0;
     const char **ext_names = glfwGetRequiredInstanceExtensions(&ext_count);
+    if (!ext_names || ext_count == 0) {
+        fprintf(stderr, "[vulkan] No required Vulkan instance extensions available\n");
+        free(vk);
+        return NULL;
+    }
 
     VkApplicationInfo app_info = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -2297,16 +2331,25 @@ MiniVkContext *mini_vk_create(void *glfw_window, int width, int height, int vsyn
     VkQueueFamilyProperties *qf_props = (VkQueueFamilyProperties *)malloc(qf_count * sizeof(VkQueueFamilyProperties));
     vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &qf_count, qf_props);
 
+    int found_qf = 0;
     vk->graphics_queue_family = 0;
     for (uint32_t i = 0; i < qf_count; i++) {
         VkBool32 present_support = VK_FALSE;
         vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device, i, vk->surface, &present_support);
         if ((qf_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present_support) {
             vk->graphics_queue_family = i;
+            found_qf = 1;
             break;
         }
     }
     free(qf_props);
+    if (!found_qf) {
+        fprintf(stderr, "[vulkan] No queue family supports both graphics and presentation\n");
+        vkDestroySurfaceKHR(vk->instance, vk->surface, NULL);
+        vkDestroyInstance(vk->instance, NULL);
+        free(vk);
+        return NULL;
+    }
 
     /* 5. Create Logical Device */
     float queue_priority = 1.0f;

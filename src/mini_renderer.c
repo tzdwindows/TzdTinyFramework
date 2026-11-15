@@ -1579,12 +1579,18 @@ MiniRenderer *mini_renderer_create(int width, int height,
    process (fatal for multi-window, where a failed Nth window must not
    tear down windows 1..N-1). The caller owns the GLFW init/terminate
    lifecycle (mini_renderer_terminate_glfw at process exit). */
+static void mini_glfw_error_cb(int error, const char *description)
+{
+    fprintf(stderr, "[glfw] error %d: %s\n", error, description ? description : "(null)");
+}
+
 MiniRenderer *mini_renderer_create_window(int width, int height, int samples,
                                           int vsync, const MiniRendererHints *hints)
 {
     /* Become DPI-aware before the window is created so the framebuffer is
        at device resolution (no DWM bitmap upscale -> crisp on high-DPI). */
     mini_set_dpi_aware();
+    glfwSetErrorCallback(mini_glfw_error_cb);
     if (!glfwInit())
         return NULL;
 
@@ -1696,8 +1702,10 @@ MiniRenderer *mini_renderer_create_window(int width, int height, int samples,
         glfwSwapInterval(1);
     else
         glfwSwapInterval(0);
+    const char *gl_ver = (const char *)glGetString(GL_VERSION);
+    const char *glsl_ver = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
     fprintf(stderr, "[gl] GL_VERSION=%s  GLSL=%s\n",
-            glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
+            gl_ver ? gl_ver : "(null)", glsl_ver ? glsl_ver : "(null)");
     mini_gl_init_foundation(); /* Stage 4: resolve shader/FBO pointers + link a flat-color program */
 
     /* One-time quality/perf GL state. These are persistent; setting them

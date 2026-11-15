@@ -64,6 +64,9 @@ static void dump_nodes_rec(struct MiniNode *n, const char *prefix)
 #include <GLFW/glfw3native.h>
 #include <imm.h>
 #endif
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 /* Packers prefix bytecode bundles with this 4-byte marker so the loader
    knows whether to feed the decrypted payload to JS_Eval (source) or to
@@ -830,6 +833,98 @@ void mini_window_load_default_fonts(MiniRenderer *r)
             }
         }
     }
+#if !defined(_WIN32)
+    /* Resolve executable directory so bundled fonts load regardless of CWD */
+    char exe_dir[512] = {0};
+    ssize_t exe_len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+    if (exe_len > 0)
+    {
+        exe_dir[exe_len] = '\0';
+        char *sl = strrchr(exe_dir, '/');
+        if (sl) *sl = '\0';
+        else exe_dir[0] = '\0';
+    }
+    if (!pri_loaded && exe_dir[0])
+    {
+        const char *exe_fonts[] = {
+            "AiDianFengYaHeiChangTi.ttf",
+            "ZhouZiSongTi7000Zi-2.otf",
+            "assets/font.ttf"
+        };
+        char pbuf[600];
+        for (size_t i = 0; i < sizeof(exe_fonts) / sizeof(exe_fonts[0]); i++)
+        {
+            snprintf(pbuf, sizeof(pbuf), "%s/%s", exe_dir, exe_fonts[i]);
+            if (mini_renderer_load_font(r, pbuf) == 0)
+            {
+                pri_loaded = 1;
+                break;
+            }
+        }
+    }
+    if (!pri_loaded)
+    {
+        const char *linux_sys_fonts[] = {
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
+        };
+        for (size_t i = 0; i < sizeof(linux_sys_fonts) / sizeof(linux_sys_fonts[0]); i++)
+        {
+            if (mini_renderer_load_font(r, linux_sys_fonts[i]) == 0)
+            {
+                pri_loaded = 1;
+                break;
+            }
+        }
+    }
+    if (!pri_loaded)
+    {
+        const char *fc_cmds[] = {
+            "fc-match -f \"%{file}\" :lang=zh 2>/dev/null",
+            "fc-match -f \"%{file}\" sans 2>/dev/null"
+        };
+        for (size_t i = 0; i < sizeof(fc_cmds) / sizeof(fc_cmds[0]) && !pri_loaded; i++)
+        {
+            FILE *fp = popen(fc_cmds[i], "r");
+            if (fp)
+            {
+                char fpath[512] = {0};
+                if (fgets(fpath, sizeof(fpath), fp))
+                {
+                    size_t fl = strlen(fpath);
+                    while (fl > 0 && (fpath[fl - 1] == '\n' || fpath[fl - 1] == '\r'))
+                        fpath[--fl] = '\0';
+                    if (fl > 0 && mini_renderer_load_font(r, fpath) == 0)
+                        pri_loaded = 1;
+                }
+                pclose(fp);
+            }
+        }
+    }
+    /* Linux CJK / Emoji fallback fonts */
+    {
+        const char *linux_fallbacks[] = {
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
+        };
+        for (size_t i = 0; i < sizeof(linux_fallbacks) / sizeof(linux_fallbacks[0]); i++)
+            mini_renderer_load_fallback_font(r, linux_fallbacks[i]);
+        if (exe_dir[0])
+        {
+            char pbuf[600];
+            snprintf(pbuf, sizeof(pbuf), "%s/ZhouZiSongTi7000Zi-2.otf", exe_dir);
+            mini_renderer_load_fallback_font(r, pbuf);
+        }
+    }
+#endif
     if (win_dir[0])
     {
         char pbuf[576];

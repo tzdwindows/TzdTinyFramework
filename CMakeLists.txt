@@ -188,9 +188,16 @@ if(WIN32 AND GUI_APP)
     endif()
 endif()
 
+# colunwind (cross-platform crash capture & line-column symbolization)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(COLUNWIND_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(COLUNWIND_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+add_subdirectory(libs/colunwind EXCLUDE_FROM_ALL)
+
 # Graphics + system libs.
 if(WIN32)
     target_link_libraries(tiny_app PRIVATE
+            colunwind
             glfw3dll
             vulkan-1
             opengl32
@@ -208,7 +215,8 @@ if(WIN32)
         target_link_libraries(tiny_app PRIVATE m)
     endif()
 else()
-    target_link_libraries(tiny_app PRIVATE glfw vulkan GL m pthread dl)
+    target_link_libraries(tiny_app PRIVATE colunwind glfw vulkan GL m pthread dl)
+    target_link_options(tiny_app PRIVATE -rdynamic)
 endif()
 
 # MbedTLS.
