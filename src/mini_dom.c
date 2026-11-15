@@ -225,6 +225,9 @@ typedef struct MiniDocumentContext
     int is_restyling_active;
     struct G2dCmd *g2d_cmds;
     int g2d_count;
+    int g2d_cap;
+    int g2d_circle_ok;
+    float g2d_circle_cx, g2d_circle_cy, g2d_circle_r;
     float g2d_pts_x[8192], g2d_pts_y[8192];
     int g2d_pts_n, g2d_is_closed;
     int g2d_subpath_starts[512];
@@ -257,6 +260,7 @@ static MiniDocumentContext *mini_get_ctx(MiniDocument *doc)
     if (!g_fallback_ctx.g2d_cmds)
     {
         g_fallback_ctx.g2d_cmds = (struct G2dCmd *)calloc(G2D_CAP, sizeof(struct G2dCmd));
+        g_fallback_ctx.g2d_cap = G2D_CAP;
         g_fallback_ctx.g2d_matrix[0] = 1;
         g_fallback_ctx.g2d_matrix[3] = 1;
         g_fallback_ctx.g2d_f_size = 16.0f;
@@ -295,6 +299,11 @@ MiniDocument *mini_dom_get_active_doc(void)
 #define g_res_loader_ud (mini_get_ctx(g_active_doc)->res_loader_user_data)
 #define g2d (mini_get_ctx(g_active_doc)->g2d_cmds)
 #define g2d_n (mini_get_ctx(g_active_doc)->g2d_count)
+#define g2d_capacity (mini_get_ctx(g_active_doc)->g2d_cap)
+#define g2d_circle_ok (mini_get_ctx(g_active_doc)->g2d_circle_ok)
+#define g2d_circle_cx (mini_get_ctx(g_active_doc)->g2d_circle_cx)
+#define g2d_circle_cy (mini_get_ctx(g_active_doc)->g2d_circle_cy)
+#define g2d_circle_r (mini_get_ctx(g_active_doc)->g2d_circle_r)
 #define g2d_px (mini_get_ctx(g_active_doc)->g2d_pts_x)
 #define g2d_py (mini_get_ctx(g_active_doc)->g2d_pts_y)
 #define g2d_pn (mini_get_ctx(g_active_doc)->g2d_pts_n)
@@ -1391,6 +1400,7 @@ MiniDocument *mini_doc_create(void)
     if (ctx)
     {
         ctx->g2d_cmds = (struct G2dCmd *)calloc(G2D_CAP, sizeof(struct G2dCmd));
+        ctx->g2d_cap = G2D_CAP;
         ctx->g2d_matrix[0] = 1;
         ctx->g2d_matrix[3] = 1;
         ctx->g2d_f_size = 16.0f;
@@ -10958,13 +10968,27 @@ enum
     G2D_TEXT
 };
 
+static int g2d_ensure_cap(void)
+{
+    int cap = g2d_capacity > 0 ? g2d_capacity : G2D_CAP;
+    if (g2d_n < cap)
+        return g2d != NULL;
+    int ncap = cap * 2;
+    struct G2dCmd *np = (struct G2dCmd *)realloc(g2d, (size_t)ncap * sizeof(struct G2dCmd));
+    if (!np)
+        return 0;
+    memset(np + cap, 0, (size_t)(ncap - cap) * sizeof(struct G2dCmd));
+    g2d = np;
+    g2d_capacity = ncap;
+    return 1;
+}
+
 static void g2d_push(int kind, float x, float y, float x2, float y2,
                      float w, float h, float rr, float cr, float cg, float cb,
                      float ca, float lw)
 {
-    if (!g2d)
+    if (!g2d || !g2d_ensure_cap())
         return; /* 确保指针非空 */
-    if (g2d_n < G2D_CAP)
     {
         struct G2dCmd *c = &g2d[g2d_n++];
         c->kind = kind;
@@ -11019,16 +11043,37 @@ void mini_2d_reset(void)
     g2d_pn = 0;
     g2d_num_subs = 0;
     g2d_closed = 0;
+    g2d_circle_ok = 0;
 }
 void mini_2d_begin_path(void)
 {
     g2d_pn = 0;
     g2d_num_subs = 0;
     g2d_closed = 0;
+    g2d_circle_ok = 0;
 }
 void mini_2d_close_path(void) { g2d_closed = 1; }
+static void g2d_flush_pending_circle(void)
+{
+    if (!g2d_circle_ok)
+        return;
+    float cx = g2d_circle_cx, cy = g2d_circle_cy, r = g2d_circle_r;
+    g2d_circle_ok = 0;
+    int seg = 24;
+    float step = 6.28318530718f / seg;
+    if (g2d_num_subs == 0 && g2d_num_subs < 512)
+        g2d_subpaths[g2d_num_subs++] = g2d_pn;
+    for (int i = 0; i <= seg && g2d_pn < 8192; i++)
+    {
+        float a = step * i;
+        g2d_px[g2d_pn] = cx + r * cosf(a);
+        g2d_py[g2d_pn] = cy + r * sinf(a);
+        g2d_pn++;
+    }
+}
 void mini_2d_line_to(float x, float y)
 {
+    g2d_flush_pending_circle();
     if (g2d_num_subs == 0 && g2d_num_subs < 512)
         g2d_subpaths[g2d_num_subs++] = g2d_pn;
     g2d_pt(x, y);
@@ -11037,6 +11082,16 @@ void mini_2d_arc(float cx, float cy, float r, float a0, float a1, int ccw)
 {
     if (r < 0)
         r = 0;
+    if (!g2d_circle_ok && g2d_pn == 0 && !ccw && fabsf(a1 - a0) >= 6.28f &&
+        g2d_m[1] == 0.0 && g2d_m[2] == 0.0 && fabsf((float)(g2d_m[0] - g2d_m[3])) < 1e-4f)
+    {
+        g2d_circle_ok = 1;
+        g2d_circle_cx = (float)(g2d_m[0] * cx + g2d_m[4]);
+        g2d_circle_cy = (float)(g2d_m[3] * cy + g2d_m[5]);
+        g2d_circle_r = r * fabsf((float)g2d_m[0]);
+        return;
+    }
+    g2d_flush_pending_circle();
     int seg = 24;
     float step = (a1 - a0) / seg;
     if (ccw)
@@ -11052,6 +11107,11 @@ void mini_2d_arc(float cx, float cy, float r, float a0, float a1, int ccw)
 }
 void mini_2d_fill(float r, float g, float b, float a)
 {
+    if (g2d_circle_ok)
+    {
+        g2d_push(G2D_CIRCLE, g2d_circle_cx, g2d_circle_cy, 0, 0, 0, 0, g2d_circle_r, r, g, b, a, 0);
+        return;
+    }
     int num_sub = g2d_num_subs;
     if (num_sub == 0 && g2d_pn >= 3)
     {
@@ -11074,6 +11134,7 @@ void mini_2d_fill(float r, float g, float b, float a)
 }
 void mini_2d_stroke(float r, float g, float b, float a, float w)
 {
+    g2d_flush_pending_circle();
     if (w < 1.0f)
         w = 1.0f;
     int num_sub = g2d_num_subs;
@@ -11651,7 +11712,7 @@ void mini_2d_set_font(const char *font_str)
 static void g2d_push_text(const char *text, float x, float y, float maxw,
                           float cr, float cg, float cb, float ca)
 {
-    if (g2d_n >= G2D_CAP)
+    if (!g2d || !g2d_ensure_cap())
         return;
     struct G2dCmd *c = &g2d[g2d_n++];
     c->kind = G2D_TEXT;
@@ -11741,6 +11802,7 @@ void mini_2d_is_point_in_path(float x, float y, int *out)
 }
 void mini_2d_move_to(float x, float y)
 {
+    g2d_flush_pending_circle();
     g2d_pen_x = x;
     g2d_pen_y = y;
     if (g2d_num_subs < 512)
@@ -16157,20 +16219,6 @@ void mini_css_apply(MiniDocument *doc, const char *css)
         int pseudo = R->pseudo;
         const char *match_sel = R->match_sel;
 
-        /* During interactive restyle (:hover/:active/etc), skip static rules whose
-           selectors contain no dynamic pseudo classes. */
-        if (g_restyling)
-        {
-            if (!strstr(match_sel, ":hover") &&
-                !strstr(match_sel, ":active") &&
-                !strstr(match_sel, ":focus") &&
-                !strstr(match_sel, ":checked") &&
-                !strstr(match_sel, ":target"))
-            {
-                continue;
-            }
-        }
-
         /* Skip universal ::before / ::after reset rules (e.g. *, ::before, ::after)
            when they don't set `content`, preventing creation of empty pseudo-elements on every DOM node */
         if ((pseudo == 1 || pseudo == 2) &&
@@ -18190,17 +18238,121 @@ static void apply_inline_styles(struct MiniNode *n)
         apply_inline_styles(c);
 }
 
+static void reset_restyle_shadow_flags(struct MiniNode *n)
+{
+    if (!n)
+        return;
+    n->style.has_shadow = 0;
+    n->style.num_shadows = 0;
+    n->style.shadow_a = 0.0f;
+    if (n->pseudo_before)
+        reset_restyle_shadow_flags(n->pseudo_before);
+    if (n->pseudo_after)
+        reset_restyle_shadow_flags(n->pseudo_after);
+    for (struct MiniNode *c = n->first_child; c; c = c->next_sibling)
+        reset_restyle_shadow_flags(c);
+    if (n->shadow_root)
+        reset_restyle_shadow_flags(n->shadow_root);
+}
+
+static void sync_non_interacting_base_styles(struct MiniNode *n)
+{
+    if (!n)
+        return;
+    if (n->has_base_style && !is_node_or_ancestor_interacting(n))
+    {
+        n->base_style = n->style;
+        for (MiniActiveTransition *tr = n->active_transitions; tr; tr = tr->next)
+        {
+            if (!strcmp(tr->prop, "background-color") && tr->num_vals >= 4)
+            {
+                n->base_style.bg_r = tr->target_val[0];
+                n->base_style.bg_g = tr->target_val[1];
+                n->base_style.bg_b = tr->target_val[2];
+                n->base_style.bg_a = tr->target_val[3];
+            }
+            else if (!strcmp(tr->prop, "color") && tr->num_vals >= 4)
+            {
+                n->base_style.color_r = tr->target_val[0];
+                n->base_style.color_g = tr->target_val[1];
+                n->base_style.color_b = tr->target_val[2];
+                n->base_style.color_a = tr->target_val[3];
+            }
+            else if (!strcmp(tr->prop, "border-color") && tr->num_vals >= 4)
+            {
+                n->base_style.border_r = tr->target_val[0];
+                n->base_style.border_g = tr->target_val[1];
+                n->base_style.border_b = tr->target_val[2];
+                n->base_style.border_a = tr->target_val[3];
+            }
+            else if (!strcmp(tr->prop, "opacity") && tr->num_vals >= 1)
+            {
+                n->base_style.opacity = tr->target_val[0];
+                n->base_style.has_opacity = 1;
+            }
+            else if (!strcmp(tr->prop, "left") && tr->num_vals >= 1)
+            {
+                n->base_style.len_left.v = tr->target_val[0];
+            }
+            else if (!strcmp(tr->prop, "top") && tr->num_vals >= 1)
+            {
+                n->base_style.len_top.v = tr->target_val[0];
+            }
+            else if (!strcmp(tr->prop, "transform") && tr->num_vals >= 8)
+            {
+                n->base_style.translate_x = tr->target_val[0];
+                n->base_style.translate_y = tr->target_val[1];
+                n->base_style.translate_z = tr->target_val[2];
+                n->base_style.scale_x = tr->target_val[3];
+                n->base_style.scale_y = tr->target_val[4];
+                n->base_style.rotate_x = tr->target_val[5];
+                n->base_style.rotate_y = tr->target_val[6];
+                n->base_style.rotate_z = tr->target_val[7];
+            }
+            else if (!strcmp(tr->prop, "box-shadow") && tr->num_vals >= 8 && n->base_style.num_shadows > 0)
+            {
+                n->base_style.shadows[0].x = tr->target_val[0];
+                n->base_style.shadows[0].y = tr->target_val[1];
+                n->base_style.shadows[0].blur = tr->target_val[2];
+                n->base_style.shadows[0].spread = tr->target_val[3];
+                n->base_style.shadows[0].r = tr->target_val[4];
+                n->base_style.shadows[0].g = tr->target_val[5];
+                n->base_style.shadows[0].b = tr->target_val[6];
+                n->base_style.shadows[0].a = tr->target_val[7];
+                if (tr->target_val[7] <= 0.001f)
+                {
+                    n->base_style.has_shadow = 0;
+                    n->base_style.num_shadows = 0;
+                }
+            }
+        }
+    }
+    if (n->pseudo_before)
+        sync_non_interacting_base_styles(n->pseudo_before);
+    if (n->pseudo_after)
+        sync_non_interacting_base_styles(n->pseudo_after);
+    for (struct MiniNode *c = n->first_child; c; c = c->next_sibling)
+        sync_non_interacting_base_styles(c);
+    if (n->shadow_root)
+        sync_non_interacting_base_styles(n->shadow_root);
+}
+
 void mini_dom_restyle(struct MiniDocument *doc)
 {
     if (!doc || !g_restyle_css)
         return;
     if (doc->root)
+    {
         revert_unhovered_node(doc->root);
+        reset_restyle_shadow_flags(doc->root);
+    }
     g_restyling = 1;
     mini_css_apply(doc, g_restyle_css);
     if (doc->root)
         apply_inline_styles(doc->root);
     g_restyling = 0;
+    if (doc->root)
+        sync_non_interacting_base_styles(doc->root);
     /* A restyle re-derives styles for the whole tree; geometry may have
        changed (display / width / grid-template / font-size …). Force the
        next mini_layout_run to actually run. */

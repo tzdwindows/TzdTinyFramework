@@ -1909,6 +1909,11 @@ static const char *mini_js_shim =
        MeshStandardMaterial lighting underflows to a black cube. */
     "  p.LOW_FLOAT=0x8DF0; p.MEDIUM_FLOAT=0x8DF1; p.HIGH_FLOAT=0x8DF2;\n"
     "  p.LOW_INT=0x8DF4; p.MEDIUM_INT=0x8DF5; p.HIGH_INT=0x8DF6;\n"
+    "  p.FLOAT_VEC2=0x8B50; p.FLOAT_VEC3=0x8B51; p.FLOAT_VEC4=0x8B52;\n"
+    "  p.INT_VEC2=0x8B53; p.INT_VEC3=0x8B54; p.INT_VEC4=0x8B55;\n"
+    "  p.BOOL=0x8B56; p.BOOL_VEC2=0x8B57; p.BOOL_VEC3=0x8B58; p.BOOL_VEC4=0x8B59;\n"
+    "  p.FLOAT_MAT2=0x8B5A; p.FLOAT_MAT3=0x8B5B; p.FLOAT_MAT4=0x8B5C;\n"
+    "  p.SAMPLER_2D=0x8B5E; p.SAMPLER_CUBE=0x8B60;\n"
     "  /* ---- WebGL2 constants (queried by Three.js to detect/enable WebGL2) ---- */\n"
     "  p.READ_FRAMEBUFFER=0x8CA8; p.DRAW_FRAMEBUFFER=0x8CA9; p.MAX_COLOR_ATTACHMENTS=0x8CDF; p.COLOR_ATTACHMENT1=0x8CE1; p.COLOR_ATTACHMENT2=0x8CE2; p.COLOR_ATTACHMENT3=0x8CE3; p.COLOR_ATTACHMENT4=0x8CE4; p.COLOR_ATTACHMENT5=0x8CE5; p.COLOR_ATTACHMENT6=0x8CE6; p.COLOR_ATTACHMENT7=0x8CE7; p.COLOR_ATTACHMENT8=0x8CE8; p.COLOR_ATTACHMENT9=0x8CE9; p.COLOR_ATTACHMENT10=0x8CEA; p.COLOR_ATTACHMENT11=0x8CEB; p.COLOR_ATTACHMENT12=0x8CEC; p.COLOR_ATTACHMENT13=0x8CED; p.COLOR_ATTACHMENT14=0x8CEE; p.COLOR_ATTACHMENT15=0x8CEF;\n"
     "  p.UNIFORM_BUFFER=0x8A11; p.UNIFORM_BUFFER_BINDING=0x8A28; p.UNIFORM_BUFFER_START=0x8A29; p.UNIFORM_BUFFER_SIZE=0x8A2A; p.MAX_VERTEX_UNIFORM_BLOCKS=0x8A2B; p.MAX_FRAGMENT_UNIFORM_BLOCKS=0x8A2D; p.MAX_COMBINED_UNIFORM_BLOCKS=0x8A2E; p.MAX_UNIFORM_BUFFER_BINDINGS=0x8A2F; p.MAX_UNIFORM_BLOCK_SIZE=0x8A30; p.UNIFORM_BLOCK_BINDING=0x8A43; p.UNIFORM_BLOCK_DATA_SIZE=0x8A44; p.UNIFORM_BLOCK_ACTIVE_UNIFORMS=0x8A42; p.UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER=0x8A47; p.UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER=0x8A48; p.INVALID_INDEX=0xFFFFFFFF;\n"
@@ -3243,12 +3248,26 @@ static JSValue js_setStyle(JSContext *ctx, JSValueConst tv, int argc, JSValueCon
         prop_buf[pi] = '\0';
         mini_style_set_base(n, prop_buf, v);
         mini_style_set(n, prop_buf, v);
-        n->dirty_layout = 1;
+        int paint_only = (!strcmp(prop_buf, "transform") ||
+                          !strcmp(prop_buf, "background-color") ||
+                          !strcmp(prop_buf, "background") ||
+                          !strcmp(prop_buf, "color") ||
+                          !strcmp(prop_buf, "opacity") ||
+                          !strcmp(prop_buf, "border-radius") ||
+                          !strcmp(prop_buf, "box-shadow") ||
+                          !strcmp(prop_buf, "outline-color") ||
+                          !strcmp(prop_buf, "text-shadow") ||
+                          !strcmp(prop_buf, "z-index") ||
+                          !strcmp(prop_buf, "cursor") ||
+                          !strcmp(prop_buf, "pointer-events"));
+        if (!paint_only)
+            n->dirty_layout = 1;
         n->dirty_paint = 1;
         if (b->doc)
         {
             b->doc->dirty = 1;
-            b->doc->layout_dirty = 1;
+            if (!paint_only)
+                b->doc->layout_dirty = 1;
             b->doc->paint_dirty = 1;
         }
     }
@@ -3390,8 +3409,14 @@ static JSValue js_getBoundingClientRect(JSContext *ctx, JSValueConst tv, int arg
                 b->doc->layout_dirty = 0;
             }
         }
-        x = n->style.abs_x + n->style.translate_x;
-        y = n->style.abs_y + n->style.translate_y;
+        float tx = 0.0f, ty = 0.0f;
+        for (struct MiniNode *anc = n; anc; anc = anc->parent)
+        {
+            tx += anc->style.translate_x;
+            ty += anc->style.translate_y;
+        }
+        x = n->style.abs_x + tx;
+        y = n->style.abs_y + ty;
         w = n->style.w;
         h = n->style.h;
         if (b && b->doc && n->style.position != 3)
@@ -8594,11 +8619,32 @@ static JSValue js_gl_vertexAttrib4fv(JSContext *ctx, JSValueConst tv, int argc, 
 
 /* instanced rendering (GL 3.3+, exposed as WebGL2 native + ANGLE extension). */
 static JSValue js_gl_vertexAttribDivisor(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
-{ MiniBridge *b=bridge_of(ctx); if(argc<2)return JS_UNDEFINED; int32_t i=0,d=0; JS_ToInt32(ctx,&i,argv[0]); JS_ToInt32(ctx,&d,argv[1]); if(b&&b->gl&&b->gl->VertexAttribDivisor)b->gl->VertexAttribDivisor((GLuint)i,(GLuint)d); return JS_UNDEFINED; }
+{
+    MiniBridge *b=bridge_of(ctx); if(argc<2)return JS_UNDEFINED; int32_t i=0,d=0; JS_ToInt32(ctx,&i,argv[0]); JS_ToInt32(ctx,&d,argv[1]);
+    if(b&&b->gl&&b->gl->VertexAttribDivisor) b->gl->VertexAttribDivisor((GLuint)i,(GLuint)d);
+    else { static int once=0; if(!once){once=1; fprintf(stderr,"[gl-inst] VertexAttribDivisor is NULL!\n");} }
+    return JS_UNDEFINED;
+}
 static JSValue js_gl_drawArraysInstanced(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
-{ MiniBridge *b=bridge_of(ctx); if(argc<4)return JS_UNDEFINED; int32_t m=0,f=0,c=0,ic=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&f,argv[1]); JS_ToInt32(ctx,&c,argv[2]); JS_ToInt32(ctx,&ic,argv[3]); if(b&&b->gl&&b->gl->DrawArraysInstanced){b->gl->DrawArraysInstanced((GLenum)m,(GLint)f,(GLsizei)c,(GLsizei)ic); b->gl->webgl_drawn=1; b->gl->webgl_dirty=1;} return JS_UNDEFINED; }
+{
+    MiniBridge *b=bridge_of(ctx); if(argc<4)return JS_UNDEFINED; int32_t m=0,f=0,c=0,ic=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&f,argv[1]); JS_ToInt32(ctx,&c,argv[2]); JS_ToInt32(ctx,&ic,argv[3]);
+    if (b && b->gl && b->r && b->r->gpu.is_vulkan && b->gl->current_fbo == 0) {
+        if (!b->gl->vk_fbo) mini_gl_ensure_vk_fbo(b->gl, b->r->gpu.width, b->r->gpu.height);
+        if (b->gl->BindFramebuffer && b->gl->vk_fbo) b->gl->BindFramebuffer(0x8D40, b->gl->vk_fbo);
+    }
+    if(b&&b->gl&&b->gl->DrawArraysInstanced){b->gl->DrawArraysInstanced((GLenum)m,(GLint)f,(GLsizei)c,(GLsizei)ic); b->gl->webgl_drawn=1; b->gl->webgl_dirty=1;}
+    return JS_UNDEFINED;
+}
 static JSValue js_gl_drawElementsInstanced(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)
-{ MiniBridge *b=bridge_of(ctx); if(argc<5)return JS_UNDEFINED; int32_t m=0,c=0,t=0,ic=0; int64_t off=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&c,argv[1]); JS_ToInt32(ctx,&t,argv[2]); JS_ToInt64(ctx,&off,argv[3]); JS_ToInt32(ctx,&ic,argv[4]); if(b&&b->gl&&b->gl->DrawElementsInstanced){b->gl->DrawElementsInstanced((GLenum)m,(GLsizei)c,(GLenum)t,(const void*)(intptr_t)off,(GLsizei)ic); b->gl->webgl_drawn=1; b->gl->webgl_dirty=1;} return JS_UNDEFINED; }
+{
+    MiniBridge *b=bridge_of(ctx); if(argc<5)return JS_UNDEFINED; int32_t m=0,c=0,t=0,ic=0; int64_t off=0; JS_ToInt32(ctx,&m,argv[0]); JS_ToInt32(ctx,&c,argv[1]); JS_ToInt32(ctx,&t,argv[2]); JS_ToInt64(ctx,&off,argv[3]); JS_ToInt32(ctx,&ic,argv[4]);
+    if (b && b->gl && b->r && b->r->gpu.is_vulkan && b->gl->current_fbo == 0) {
+        if (!b->gl->vk_fbo) mini_gl_ensure_vk_fbo(b->gl, b->r->gpu.width, b->r->gpu.height);
+        if (b->gl->BindFramebuffer && b->gl->vk_fbo) b->gl->BindFramebuffer(0x8D40, b->gl->vk_fbo);
+    }
+    if(b&&b->gl&&b->gl->DrawElementsInstanced){b->gl->DrawElementsInstanced((GLenum)m,(GLsizei)c,(GLenum)t,(const void*)(intptr_t)off,(GLsizei)ic); b->gl->webgl_drawn=1; b->gl->webgl_dirty=1;}
+    return JS_UNDEFINED;
+}
 
 /* query helpers — Three.js probes these at WebGLRenderer construction */
 static JSValue js_gl_getParameter(JSContext *ctx, JSValueConst tv, int argc, JSValueConst *argv)

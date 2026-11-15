@@ -302,6 +302,30 @@ static struct MiniNode *hit_rec(struct MiniNode *n, float x, float y, float sx, 
     if (n->style.display == MINI_DISPLAY_NONE)
         return NULL; /* subtree not painted */
 
+    x -= n->style.translate_x;
+    y -= n->style.translate_y;
+    cx0 -= n->style.translate_x;
+    cx1 -= n->style.translate_x;
+    cy0 -= n->style.translate_y;
+    cy1 -= n->style.translate_y;
+    if ((n->style.scale_x > 0.001f && n->style.scale_x != 1.0f) ||
+        (n->style.scale_y > 0.001f && n->style.scale_y != 1.0f))
+    {
+        float ox = n->style.transform_origin_x;
+        float oy = n->style.transform_origin_y;
+        if (ox == 0.0f && oy == 0.0f) { ox = 0.5f; oy = 0.5f; }
+        float cx = n->style.abs_x + n->style.w * ox;
+        float cy = n->style.abs_y + n->style.h * oy;
+        float sx_sc = n->style.scale_x > 0.001f ? n->style.scale_x : 1.0f;
+        float sy_sc = n->style.scale_y > 0.001f ? n->style.scale_y : 1.0f;
+        x = cx + (x - cx) / sx_sc;
+        y = cy + (y - cy) / sy_sc;
+        cx0 = cx + (cx0 - cx) / sx_sc;
+        cx1 = cx + (cx1 - cx) / sx_sc;
+        cy0 = cy + (cy0 - cy) / sy_sc;
+        cy1 = cy + (cy1 - cy) / sy_sc;
+    }
+
     int is_fixed = parent_fixed || (n->style.position == 3 || n->style.position == 4);
     float test_x = is_fixed ? x : (x + sx);
     float test_y = is_fixed ? y : (y + sy);

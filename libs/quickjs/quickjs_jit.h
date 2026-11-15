@@ -48,9 +48,13 @@ struct JSJITEntry {
     uint64_t id;             /* monotonic, == index in registry          */
     JSFunctionBytecode *bc;  /* owning bytecode (weak)                   */
     void *code;              /* generated native code (SLJIT); NULL=stub */
-    size_t code_size;        /* size of `code` in bytes                   */
+    size_t code_size;        /* size of `code` in bytes                  */
     int status;
-    JSAtom name;             /* function name atom, for tracing           */
+    int is_native;           /* 1 = unboxed worker_native, 0 = JitCtx    */
+    int self_recursive;      /* 1 = contains self-recursive calls        */
+    void *ic_data;           /* inline-cache table for field accesses    */
+    uint32_t ic_count;       /* number of entries in ic_data             */
+    JSAtom name;             /* function name atom, for tracing          */
 };
 
 /* Per-runtime JIT registry / state. Lives at rt->jit_state. */
@@ -78,7 +82,7 @@ int js_jit_compile(JSContext *ctx, JSFunctionBytecode *b);
 /* Execute compiled code for b. Updates *psp, *ppc, *pret_val.
    Pre: b->jit_entry != NULL. Returns JS_JIT_DONE or JS_JIT_BAIL. */
 int js_jit_run(JSContext *ctx, JSFunctionBytecode *b, JSStackFrame *sf,
-               JSValue **psp, uint8_t **ppc, JSValue *pret_val);
+               JSValue this_obj, JSValue **psp, uint8_t **ppc, JSValue *pret_val);
 
 /* Release the native code + entry for b (no-op if not compiled). */
 void js_jit_invalidate(JSRuntime *rt, JSFunctionBytecode *b);
