@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,6 +32,8 @@ jobs:
       - name: Build tiny_app
         run: |
           cmake --build build_linux --target tiny_app -j$(nproc)
+          echo "Max GLIBC versions required:"
+          objdump -T build/tiny_app | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -n 10 || true
 
       - name: Package Linux release archive
         run: |
