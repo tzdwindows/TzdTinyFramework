@@ -59,7 +59,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@v1.13.0
 
       - name: Setup Ninja & Clang
         shell: pwsh
@@ -70,7 +70,7 @@ jobs:
           clang --version
 
       - name: Setup Vulkan SDK
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-version: latest
           vulkan-components: Vulkan-Headers,Vulkan-Loader
