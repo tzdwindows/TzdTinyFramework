@@ -11957,6 +11957,70 @@ static int mini_bridge_eval_module(MiniBridge *b, const char *src, size_t len,
     return 0;
 }
 
+/* Strip file:// prefix into a local filesystem path (preserving leading '/' on POSIX). */
+static const char *strip_file_scheme(const char *p)
+{
+    if (!p) return NULL;
+    if (!strncmp(p, "file://", 7))
+    {
+        p += 7;
+        if (p[0] == '/' && p[1] && p[2] == ':')
+            p++;
+    }
+    return p;
+}
+
+static char *read_local_script_file(MiniBridge *b, const char *src, size_t *out_len)
+{
+    if (out_len) *out_len = 0;
+    const char *fpath = strip_file_scheme(src);
+    if (!fpath || !fpath[0]) return NULL;
+
+    FILE *fp = NULL;
+    int is_abs = (fpath[0] == '/' || fpath[0] == '\\' || (fpath[1] == ':' && (fpath[2] == '/' || fpath[2] == '\\')));
+    if (!is_abs && b && b->doc_url && !strncmp(b->doc_url, "file://", 7))
+    {
+        const char *doc_path = strip_file_scheme(b->doc_url);
+        const char *slash = strrchr(doc_path, '/');
+        const char *bslash = strrchr(doc_path, '\\');
+        if (bslash && (!slash || bslash > slash)) slash = bslash;
+        if (slash)
+        {
+            const char *rel = fpath;
+            if (rel[0] == '.' && (rel[1] == '/' || rel[1] == '\\')) rel += 2;
+            size_t dir_len = (size_t)(slash - doc_path + 1);
+            size_t rel_len = strlen(rel);
+            char *joined = (char *)malloc(dir_len + rel_len + 1);
+            if (joined)
+            {
+                memcpy(joined, doc_path, dir_len);
+                memcpy(joined + dir_len, rel, rel_len + 1);
+                fp = fopen(joined, "rb");
+                free(joined);
+            }
+        }
+    }
+    if (!fp) fp = fopen(fpath, "rb");
+    if (!fp) return NULL;
+
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *code = NULL;
+    if (sz > 0)
+    {
+        code = (char *)malloc((size_t)sz + 1);
+        if (code)
+        {
+            size_t r = fread(code, 1, (size_t)sz, fp);
+            code[r] = 0;
+            if (out_len) *out_len = r;
+        }
+    }
+    fclose(fp);
+    return code;
+}
+
 static void eval_scripts(struct MiniNode *n, MiniBridge *b)
 {
     if (!n)
@@ -11996,24 +12060,11 @@ static void eval_scripts(struct MiniNode *n, MiniBridge *b)
             }
             else if (is_local_src)
             {
-                const char *fpath = src;
-                if (!strncmp(fpath, "file:///", 8)) fpath += 8;
-                else if (!strncmp(fpath, "file://", 7)) fpath += 7;
-                FILE *fp = fopen(fpath, "rb");
-                if (fp) {
-                    fseek(fp, 0, SEEK_END);
-                    long sz = ftell(fp);
-                    fseek(fp, 0, SEEK_SET);
-                    if (sz > 0) {
-                        char *code = (char *)malloc(sz + 1);
-                        if (code) {
-                            size_t r = fread(code, 1, sz, fp);
-                            code[r] = 0;
-                            mini_bridge_eval_module(b, code, r, src);
-                            free(code);
-                        }
-                    }
-                    fclose(fp);
+                size_t r = 0;
+                char *code = read_local_script_file(b, src, &r);
+                if (code) {
+                    mini_bridge_eval_module(b, code, r, src);
+                    free(code);
                 }
             }
             else if (script_text)
@@ -12040,24 +12091,11 @@ static void eval_scripts(struct MiniNode *n, MiniBridge *b)
             }
             else if (is_local_src)
             {
-                const char *fpath = src;
-                if (!strncmp(fpath, "file:///", 8)) fpath += 8;
-                else if (!strncmp(fpath, "file://", 7)) fpath += 7;
-                FILE *fp = fopen(fpath, "rb");
-                if (fp) {
-                    fseek(fp, 0, SEEK_END);
-                    long sz = ftell(fp);
-                    fseek(fp, 0, SEEK_SET);
-                    if (sz > 0) {
-                        char *code = (char *)malloc(sz + 1);
-                        if (code) {
-                            size_t r = fread(code, 1, sz, fp);
-                            code[r] = 0;
-                            mini_bridge_eval(b, code, r, src);
-                            free(code);
-                        }
-                    }
-                    fclose(fp);
+                size_t r = 0;
+                char *code = read_local_script_file(b, src, &r);
+                if (code) {
+                    mini_bridge_eval(b, code, r, src);
+                    free(code);
                 }
             }
             else if (script_text)

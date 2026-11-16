@@ -2120,6 +2120,8 @@ static int create_swapchain(MiniVkContext *vk) {
         extent.height = h;
     }
     vk->swapchain_extent = extent;
+    vk->width = (int)extent.width;
+    vk->height = (int)extent.height;
 
     /* Choose Present Mode: Mailbox for ultra-low latency without tearing, FIFO for vsync */
     VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
@@ -2610,12 +2612,20 @@ void mini_vk_flush(MiniVkContext *vk, struct MiniRenderer *r) {
     if (!vk->in_frame) {
         vkWaitForFences(vk->device, 1, &vk->in_flight_fence[f_idx], VK_TRUE, UINT64_MAX);
 
+        if (vk->framebuffer_resized) {
+            recreate_swapchain(vk);
+        }
+
         /* Acquire Next Swapchain Image */
         uint32_t image_index = 0;
         VkResult res = vkAcquireNextImageKHR(vk->device, vk->swapchain, UINT64_MAX,
                                              vk->image_available_sem[f_idx], VK_NULL_HANDLE, &image_index);
-        if (res == VK_ERROR_OUT_OF_DATE_KHR || vk->framebuffer_resized) {
+        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
             recreate_swapchain(vk);
+            res = vkAcquireNextImageKHR(vk->device, vk->swapchain, UINT64_MAX,
+                                        vk->image_available_sem[f_idx], VK_NULL_HANDLE, &image_index);
+        }
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
             return;
         }
         vk->current_image_index = image_index;
