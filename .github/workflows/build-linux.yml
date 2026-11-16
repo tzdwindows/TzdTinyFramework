@@ -44,9 +44,3 @@ jobs:
           cp build/ZhouZiSongTi7000Zi-2.otf dist_linux/
           cp LICENSE README.md dist_linux/
           tar -czf TzdTinyFramework-linux-x64.tar.gz -C dist_linux .
-
-      - name: Upload to Release v0.2.0
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload v0.2.0 TzdTinyFramework-linux-x64.tar.gz build/tiny_app#tiny_app-linux-x64 --clobber

@@ -1,0 +1,148 @@
+name: Release (Linux & Windows)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang libglfw3-dev libgl-dev libvulkan-dev
+
+      - name: Configure CMake
+        run: |
+          cmake -B build_linux -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build tiny_app
+        run: |
+          cmake --build build_linux --target tiny_app -j$(nproc)
+          echo "Max GLIBC versions required:"
+          objdump -T build/tiny_app | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -n 10 || true
+
+      - name: Package Linux release
+        run: |
+          mkdir -p dist_linux release_linux
+          cp build/tiny_app dist_linux/tiny_app
+          chmod +x dist_linux/tiny_app
+          cp build/AiDianFengYaHeiChangTi.ttf dist_linux/
+          cp build/ZhouZiSongTi7000Zi-2.otf dist_linux/
+          cp LICENSE README.md dist_linux/
+          tar -czf release_linux/TzdTinyFramework-linux-x64.tar.gz -C dist_linux .
+          cp build/tiny_app release_linux/tiny_app-linux-x64
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: release_linux/*
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Ninja & Clang
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          clang --version
+
+      - name: Setup Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-version: latest
+          vulkan-components: Vulkan-Headers,Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Download GLFW 3.4
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.bin.WIN64.zip" -OutFile "glfw.zip"
+          Expand-Archive -Path "glfw.zip" -DestinationPath "$env:RUNNER_TEMP\glfw" -Force
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $glfwRoot = "$env:RUNNER_TEMP\glfw\glfw-3.4.bin.WIN64"
+          $vkRoot = $env:VULKAN_SDK
+          cmake -B build_win -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "-DGLFW_ROOT=$glfwRoot" "-DVULKAN_ROOT=$vkRoot"
+
+      - name: Build tiny_app
+        shell: pwsh
+        run: |
+          cmake --build build_win --target tiny_app -j 4
+
+      - name: Package Windows release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist_win, release_win | Out-Null
+          Copy-Item build/tiny_app.exe dist_win/tiny_app.exe
+          Copy-Item "$env:RUNNER_TEMP\glfw\glfw-3.4.bin.WIN64\lib-vc2022\glfw3.dll" dist_win/glfw3.dll
+          Copy-Item build/AiDianFengYaHeiChangTi.ttf dist_win/
+          Copy-Item build/ZhouZiSongTi7000Zi-2.otf dist_win/
+          Copy-Item LICENSE, README.md dist_win/
+          Compress-Archive -Path dist_win/* -DestinationPath release_win/TzdTinyFramework-win64.zip -Force
+          Copy-Item build/tiny_app.exe release_win/tiny_app.exe
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release_win/*
+
+  publish-release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: release_assets
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: release_assets
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release_assets/* --clobber
+          else
+            gh release create "$TAG" release_assets/* --title "$TAG" --generate-notes
+          fi
